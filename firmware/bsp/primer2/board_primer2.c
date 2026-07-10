@@ -101,7 +101,9 @@ static int pin_get(uint32_t base, int pin) { return (GPIO_IDR(base) >> pin) & 1u
    that exact value, so pitch stays correct at any of these clock choices. To
    change the overclock, edit PLL_MUL only (and re-check I2S_I2SDIV for ~48 kHz). */
 #define HSE_HZ     12000000u
-#define PLL_MUL    8u                       /* x8 -> 96 MHz (x6 = 72 MHz stock) */
+#define PLL_MUL    8u                        /* x8 -> 96 MHz (x6 = 72 MHz stock).
+   96 MHz is the practical ceiling: above it the flash (2 wait-states max) is too
+   slow for the cold code that still executes from flash at boot/UI/playback. */
 #define SYSCLK_HZ  (HSE_HZ * PLL_MUL)       /* 96 MHz */
 #define APB1_HZ    (SYSCLK_HZ / 4u)         /* 24 MHz (PPRE1 = /4) */
 
@@ -295,7 +297,7 @@ static unsigned g_wr;                    /* write cursor (in samples) */
    PFM_MIX_RATE + 0.16% (~3 cents, inaudible). So the codec consumes exactly
    what the emulator produces, 1:1. */
 #define I2S_I2SDIV 27u
-#define I2S_ODD    0u
+#define I2S_ODD    0u   /* 2*27+0 = 54 -> 96e6/(32*54) = 55555.6 Hz (= OPNA rate) */
 #define I2S_FS (SYSCLK_HZ / (32u * (2u * I2S_I2SDIV + I2S_ODD))) /* 55556 Hz */
 
 static void i2c_codec_write(const uint8_t *cr, int n) {
@@ -371,14 +373,6 @@ static void i2s_dma_init(void) {
 
 static unsigned ring_read_pos(void) { return (AUD_RING * 2) - DMA2_CNDTR2; }
 
-static void ring_push(int16_t l, int16_t r) {
-  unsigned next = (g_wr + 2) % (AUD_RING * 2);
-  while (next == (ring_read_pos() & ~1u)) { __asm__ volatile("nop"); } /* full: busy-wait on DMA */
-  g_ring[g_wr] = l;
-  g_ring[g_wr + 1] = r;
-  g_wr = next;
-}
-
 void board_audio_open(unsigned rate, uint32_t total_frames) {
   (void)rate; (void)total_frames;
   for (unsigned i = 0; i < AUD_RING * 2; i++) g_ring[i] = 0;
@@ -387,12 +381,29 @@ void board_audio_open(unsigned rate, uint32_t total_frames) {
   i2s_dma_init();
 }
 
-/* Push OPNA frames into the DMA FIFO 1:1 (no resample). ring_push() stalls on
-   backpressure, so this is where the emulator is paced to the codec's rate. */
+/* Push OPNA frames into the DMA FIFO 1:1 (no resample). Copies in contiguous
+   runs, reading the DMA position only once per run instead of per frame (that
+   volatile AHB read, contended by the active DMA, was the whole cost before).
+   Spins only when the FIFO is genuinely full, so it still paces to codec rate. */
 void board_audio_write(const int16_t *src, size_t frames) {
   uint32_t prof_t0 = pfm_prof_begin();
-  for (size_t i = 0; i < frames; i++)
-    ring_push(src[i * 2 + 0], src[i * 2 + 1]);
+  const unsigned size = AUD_RING * 2;         /* samples in the ring */
+  size_t total = frames * 2, done = 0;
+  while (done < total) {
+    unsigned rd = ring_read_pos() & ~1u;      /* DMA read cursor (one AHB read) */
+    unsigned wr = g_wr;
+    unsigned freesmp = (rd - wr - 2u) & (size - 1u); /* free samples, 1-frame gap */
+    if (freesmp == 0) { __asm__ volatile("nop"); continue; } /* full: wait for DMA */
+    unsigned run = size - wr;                 /* contiguous run to ring end */
+    if (run > freesmp) run = freesmp;
+    unsigned rem = (unsigned)(total - done);
+    if (run > rem) run = rem;
+    for (unsigned k = 0; k < run; k++) g_ring[wr + k] = src[done + k];
+    wr += run;
+    if (wr >= size) wr -= size;
+    g_wr = wr;
+    done += run;
+  }
   pfm_prof_end(PFM_PROF_OUTPUT, prof_t0);
 }
 
