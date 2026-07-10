@@ -68,26 +68,43 @@ static unsigned blkfnum2keycode(unsigned blk, unsigned fnum) {
 }
 #undef F
 
-static void opna_fm_slot_phase(struct opna_fm_slot *slot, unsigned freq) {
+/* Phase increment for one slot at a given source freq. This is invariant
+   between register writes, so we precompute it (opna_fm_chan_calc_phase_inc)
+   instead of recomputing per output sample. Formula identical to the old
+   opna_fm_slot_phase body. */
+static uint32_t slot_phase_inc(const struct opna_fm_slot *slot, unsigned freq) {
   unsigned det = pfm_dettable[slot->det & 0x3][slot->keycode];
   if (slot->det & 0x4) det = -det;
   freq += det;
   freq &= (1u << 17) - 1;
   int mul = slot->mul << 1;
   if (!mul) mul = 1;
-  slot->phase += ((freq * mul) >> 1);
+  return (uint32_t)((freq * mul) >> 1);
 }
 
+/* Recompute channel c's four slot phase increments from the current freq
+   source(s). Call after ANY write that changes blk/fnum/det/mul/keycode/CH3. */
+static void opna_fm_chan_calc_phase_inc(struct opna_fm *fm, int c) {
+  struct opna_fm_channel *chan = &fm->channel[c];
+  if (c == 2 && fm->ch3.mode != CH3_MODE_NORMAL) {
+    chan->slot[0].phase_inc = slot_phase_inc(&chan->slot[0], blkfnum2freq(fm->ch3.blk[0], fm->ch3.fnum[0]));
+    chan->slot[1].phase_inc = slot_phase_inc(&chan->slot[1], blkfnum2freq(fm->ch3.blk[1], fm->ch3.fnum[1]));
+    chan->slot[2].phase_inc = slot_phase_inc(&chan->slot[2], blkfnum2freq(fm->ch3.blk[2], fm->ch3.fnum[2]));
+    chan->slot[3].phase_inc = slot_phase_inc(&chan->slot[3], blkfnum2freq(chan->blk, chan->fnum));
+  } else {
+    unsigned freq = blkfnum2freq(chan->blk, chan->fnum);
+    for (int i = 0; i < 4; i++)
+      chan->slot[i].phase_inc = slot_phase_inc(&chan->slot[i], freq);
+  }
+}
+
+/* Per-sample phase advance: just add the precomputed increment (both normal and
+   CH3-SE cases — the SE freq source is already baked into phase_inc). */
 static void opna_fm_chan_phase(struct opna_fm_channel *chan) {
-  unsigned freq = blkfnum2freq(chan->blk, chan->fnum);
-  for (int i = 0; i < 4; i++) opna_fm_slot_phase(&chan->slot[i], freq);
-}
-
-static void opna_fm_chan_phase_se(struct opna_fm_channel *chan, struct opna_fm *fm) {
-  opna_fm_slot_phase(&chan->slot[0], blkfnum2freq(fm->ch3.blk[0], fm->ch3.fnum[0]));
-  opna_fm_slot_phase(&chan->slot[1], blkfnum2freq(fm->ch3.blk[1], fm->ch3.fnum[1]));
-  opna_fm_slot_phase(&chan->slot[2], blkfnum2freq(fm->ch3.blk[2], fm->ch3.fnum[2]));
-  opna_fm_slot_phase(&chan->slot[3], blkfnum2freq(chan->blk, chan->fnum));
+  chan->slot[0].phase += chan->slot[0].phase_inc;
+  chan->slot[1].phase += chan->slot[1].phase_inc;
+  chan->slot[2].phase += chan->slot[2].phase_inc;
+  chan->slot[3].phase += chan->slot[3].phase_inc;
 }
 
 struct fm_frame {
@@ -185,7 +202,7 @@ static struct fm_frame opna_fm_chanout(struct opna_fm_channel *chan) {
   return ret;
 }
 
-static void opna_fm_slot_setrate(struct opna_fm_slot *slot, int status) {
+PFM_HOT static void opna_fm_slot_setrate(struct opna_fm_slot *slot, int status) {
   int r;
   switch (status) {
   case PFM_ENV_ATTACK: r = slot->ar; break;
@@ -215,7 +232,7 @@ static void opna_fm_slot_setrate(struct opna_fm_slot *slot, int status) {
   }
 }
 
-static void opna_fm_slot_env(struct opna_fm_slot *slot) {
+PFM_HOT static void opna_fm_slot_env(struct opna_fm_slot *slot) {
   int rate_shifter = slot->rate_shifter;
   if ((slot->env_count & ((1 << rate_shifter) - 1)) == ((1 << rate_shifter) - 1)) {
     int rate_index = (slot->env_count >> rate_shifter) & 7;
@@ -258,7 +275,7 @@ static void opna_fm_slot_env(struct opna_fm_slot *slot) {
   slot->env_count++;
 }
 
-static void opna_fm_slot_key(struct opna_fm_channel *chan, int slotnum, bool keyon) {
+PFM_HOT static void opna_fm_slot_key(struct opna_fm_channel *chan, int slotnum, bool keyon) {
   struct opna_fm_slot *slot = &chan->slot[slotnum];
   if (keyon) {
     if (!slot->keyon) {
@@ -327,6 +344,7 @@ void opna_fm_writereg(struct opna_fm *fm, unsigned reg, unsigned val) {
         opna_fm_slot_setrate(&fm->channel[2].slot[c],
                              fm->channel[2].slot[c].env_state);
       }
+      opna_fm_chan_calc_phase_inc(fm, 2);
     }
     return;
   }
@@ -353,6 +371,7 @@ void opna_fm_writereg(struct opna_fm *fm, unsigned reg, unsigned val) {
   case 0x30:
     slot->det = (val >> 4) & 0x7;
     slot->mul = val & 0xf;
+    opna_fm_chan_calc_phase_inc(fm, c);
     break;
   case 0x40:
     slot->tl = val & 0x7f;
@@ -384,6 +403,7 @@ void opna_fm_writereg(struct opna_fm *fm, unsigned reg, unsigned val) {
         chan->slot[3].keycode = blkfnum2keycode(blk, fnum);
         opna_fm_slot_setrate(&chan->slot[3], chan->slot[3].env_state);
       }
+      opna_fm_chan_calc_phase_inc(fm, c);
       break;
     case 0x8:
       c = (c + 2) % 3;
@@ -394,6 +414,7 @@ void opna_fm_writereg(struct opna_fm *fm, unsigned reg, unsigned val) {
         opna_fm_slot_setrate(&fm->channel[2].slot[c],
                              fm->channel[2].slot[c].env_state);
       }
+      opna_fm_chan_calc_phase_inc(fm, 2);
       break;
     case 0x4:
     case 0xc:
@@ -417,7 +438,20 @@ void opna_fm_writereg(struct opna_fm *fm, unsigned reg, unsigned val) {
   }
 }
 
-void opna_fm_mix(struct opna_fm *fm, int16_t *buf, unsigned samples) {
+/* A channel whose 4 operators are all in the OFF state AND whose entire signal
+   state (prevout, feedback, algorithm memory) is already zero produces exactly
+   0 and cannot change its own state (slotout of an OFF operator is 0; keyon
+   resets phase). So chanout+phase can be skipped bit-exactly. All four terms are
+   load-bearing: an OFF slot may still hold a non-zero prevout for one sample. */
+static inline bool chan_is_silent(const struct opna_fm_channel *chan) {
+  return chan->fbmem == 0 && chan->alg_mem == 0 &&
+         chan->slot[0].env_state == PFM_ENV_OFF && chan->slot[0].prevout == 0 &&
+         chan->slot[1].env_state == PFM_ENV_OFF && chan->slot[1].prevout == 0 &&
+         chan->slot[2].env_state == PFM_ENV_OFF && chan->slot[2].prevout == 0 &&
+         chan->slot[3].env_state == PFM_ENV_OFF && chan->slot[3].prevout == 0;
+}
+
+PFM_HOT void opna_fm_mix(struct opna_fm *fm, int16_t *buf, unsigned samples) {
   for (unsigned i = 0; i < samples; i++) {
     if (!fm->env_div3) {
       for (int c = 0; c < 6; c++) {
@@ -434,12 +468,9 @@ void opna_fm_mix(struct opna_fm *fm, int16_t *buf, unsigned samples) {
     int32_t ro = buf[i * 2 + 1];
 
     for (int c = 0; c < 6; c++) {
+      if (chan_is_silent(&fm->channel[c])) continue; /* contributes 0, no state change */
       struct fm_frame o = opna_fm_chanout(&fm->channel[c]);
-      if (c == 2 && fm->ch3.mode != CH3_MODE_NORMAL) {
-        opna_fm_chan_phase_se(&fm->channel[c], fm);
-      } else {
-        opna_fm_chan_phase(&fm->channel[c]);
-      }
+      opna_fm_chan_phase(&fm->channel[c]);
       if (fm->mask & (1 << c)) continue;
       if (fm->lselect[c]) lo += o.data[1];
       if (fm->rselect[c]) ro += o.data[0];

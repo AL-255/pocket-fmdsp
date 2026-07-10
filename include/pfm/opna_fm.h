@@ -26,6 +26,8 @@ enum {
 /* One FM operator ("slot"). */
 struct opna_fm_slot {
   uint32_t phase;        /* 20-bit phase accumulator */
+  uint32_t phase_inc;    /* per-sample phase increment (precomputed on any
+                            blk/fnum/det/mul/keycode/CH3-mode change) */
   uint16_t env;          /* 10-bit attenuation (0..1023) */
   uint16_t env_count;
   uint8_t env_state;

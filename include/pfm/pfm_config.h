@@ -11,6 +11,19 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+/* PFM_HOT: place the per-sample render functions in the .ramfunc SRAM section
+   (0 wait-states). Enabled only for the real hardware build (-DPFM_RAMFUNC),
+   where flash is under-spec at the 96 MHz overclock; a no-op elsewhere. */
+#ifdef PFM_RAMFUNC
+#define PFM_HOT __attribute__((section(".ramfunc")))
+/* Force a hot lookup table into .data (SRAM). Without this, GCC leaves a
+   never-written static array in .rodata (flash) even after dropping const. */
+#define PFM_RAMDATA __attribute__((section(".data")))
+#else
+#define PFM_HOT
+#define PFM_RAMDATA
+#endif
+
 /* OPNA master clock (YM2608 on PC-98). */
 #define PFM_OPNA_MASTER_CLOCK 7987200u
 

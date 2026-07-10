@@ -8,11 +8,14 @@
  */
 
 #include <stdint.h>
+#include "pfm/pfm_config.h"  /* PFM_RAMDATA */
 
 #define PFM_LOGSINTABLEBIT 8
 #define PFM_LOGSINTABLELEN (1 << PFM_LOGSINTABLEBIT)
 /* round(-256.0*log2((sin((2*i+1)*PI/1024.0)))) */
-static const uint16_t pfm_logsintable[PFM_LOGSINTABLELEN] = {
+/* NOT const: lives in .data (0-wait SRAM) — read per-operator per-sample, so
+   flash wait-states at the 96 MHz overclock would stall every lookup. */
+static PFM_RAMDATA uint16_t pfm_logsintable[PFM_LOGSINTABLELEN] = {
   2137, 1731, 1543, 1419, 1326, 1252, 1190, 1137,
   1091, 1050, 1013,  979,  949,  920,  894,  869,
    846,  825,  804,  785,  767,  749,  732,  717,
@@ -50,7 +53,8 @@ static const uint16_t pfm_logsintable[PFM_LOGSINTABLELEN] = {
 #define PFM_EXPTABLEBIT 8
 #define PFM_EXPTABLELEN (1 << PFM_EXPTABLEBIT)
 /* round((1<<11) / pow(2.0, (i+1.0)/256.0)) */
-static const uint16_t pfm_exptable[PFM_EXPTABLELEN] = {
+/* NOT const: in .data (0-wait SRAM) — read per-operator per-sample. */
+static PFM_RAMDATA uint16_t pfm_exptable[PFM_EXPTABLELEN] = {
   2042, 2037, 2031, 2026, 2020, 2015, 2010, 2004,
   1999, 1993, 1988, 1983, 1977, 1972, 1966, 1961,
   1956, 1951, 1945, 1940, 1935, 1930, 1924, 1919,
@@ -86,7 +90,8 @@ static const uint16_t pfm_exptable[PFM_EXPTABLELEN] = {
 };
 
 /* Envelope increment pattern: [rate_selector][env_count phase]. */
-static const uint8_t pfm_rateinctable[4 * 2][8] = {
+/* NOT const: in .data (0-wait SRAM) — read in the per-env-tick slot_env path. */
+static PFM_RAMDATA uint8_t pfm_rateinctable[4 * 2][8] = {
   {1, 0, 1, 0, 1, 0, 1, 0},
   {1, 0, 1, 0, 1, 1, 1, 0},
   {1, 0, 1, 1, 1, 0, 1, 1},

@@ -11,7 +11,7 @@ MEMORY
 }
 
 _estack = ORIGIN(RAM) + LENGTH(RAM);   /* top of stack */
-_Min_Heap_Size  = 0x400;
+_Min_Heap_Size  = 0x0;                  /* freestanding: no malloc */
 _Min_Stack_Size = 0x1000;
 
 SECTIONS
@@ -58,6 +58,18 @@ SECTIONS
     . = ALIGN(4);
     _edata = .;
   } >RAM AT> FLASH
+
+  /* Hot render code copied into 0-wait SRAM (flash is under-spec at 96 MHz). */
+  .ramfunc :
+  {
+    . = ALIGN(4);
+    _sramfunc = .;
+    *(.ramfunc)
+    *(.ramfunc*)
+    . = ALIGN(4);
+    _eramfunc = .;
+  } >RAM AT> FLASH
+  _siramfunc = LOADADDR(.ramfunc);
 
   .bss :
   {

@@ -85,3 +85,5 @@ add_hw_target(pocketfm_hw
   ${VENDOR_SRC}
 )
 target_include_directories(pocketfm_hw PRIVATE gen)
+# place the per-sample render functions in 0-wait SRAM (.ramfunc)
+target_compile_definitions(pocketfm_hw PRIVATE PFM_RAMFUNC=1)

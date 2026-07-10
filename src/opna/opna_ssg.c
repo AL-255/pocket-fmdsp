@@ -7,7 +7,8 @@
 #include "pfm/opna_ssg.h"
 
 /* Captured from YMF288. 5-bit level index -> linear volume. */
-static const uint16_t voltable[32] = {
+/* NOT const: in .data (0-wait SRAM) — read per raw SSG sample (~4.5x/output). */
+static PFM_RAMDATA uint16_t voltable[32] = {
   0, 0, 0, 0, 4, 8, 12, 16,
   20, 24, 28, 32, 36, 44, 52, 64,
   76, 92, 108, 128, 152, 180, 216, 256,
@@ -110,7 +111,7 @@ static void ssg_raw_sample(struct opna_ssg *ssg, int16_t out[3]) {
 #define RINGMASK (PFM_SSG_RING - 1)
 #define BUFINDEX(idx, n) ((((idx) >> 1) + (n)) & RINGMASK)
 
-void opna_ssg_mix(struct opna_ssg *ssg, struct opna_ssg_resampler *r,
+PFM_HOT void opna_ssg_mix(struct opna_ssg *ssg, struct opna_ssg_resampler *r,
                   int16_t *buf, unsigned samples) {
   for (unsigned i = 0; i < samples; i++) {
     /* generate the raw samples that fall in this output step (4 or 5) */
