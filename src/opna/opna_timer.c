@@ -1,6 +1,7 @@
 /* OPNA Timer A/B + render loop. Ported from libopna/opnatimer.c (no oscillo). */
 #include "pfm/opna_timer.h"
 #include "pfm/opna.h"
+#include "pfm/pfm_prof.h"
 
 enum {
   TIMERA_BITS = 10,
@@ -63,7 +64,11 @@ void opna_timer_mix(struct opna_timer *timer, int16_t *buf, unsigned samples) {
       if (ta < generate_samples) generate_samples = ta;
     }
     opna_mix(timer->opna, buf, generate_samples);
-    if (timer->mix_cb) timer->mix_cb(timer->mix_userptr, buf, generate_samples);
+    if (timer->mix_cb) {
+      uint32_t t = pfm_prof_begin();
+      timer->mix_cb(timer->mix_userptr, buf, generate_samples);
+      pfm_prof_end(PFM_PROF_PCM, t);
+    }
     buf += generate_samples * 2;
     samples -= generate_samples;
     if (timer->timera_load) {
@@ -71,7 +76,11 @@ void opna_timer_mix(struct opna_timer *timer, int16_t *buf, unsigned samples) {
       if (!timer->timera && timer->timera_enable) {
         if (!(timer->status & (1 << 0))) {
           timer->status |= (1 << 0);
-          if (timer->interrupt_cb) timer->interrupt_cb(timer->interrupt_userptr);
+          if (timer->interrupt_cb) {
+            uint32_t t = pfm_prof_begin();
+            timer->interrupt_cb(timer->interrupt_userptr);
+            pfm_prof_end(PFM_PROF_SEQ, t);
+          }
         }
       }
       timer->timera &= (1 << TIMERA_BITS) - 1;
@@ -81,7 +90,11 @@ void opna_timer_mix(struct opna_timer *timer, int16_t *buf, unsigned samples) {
       if (!timer->timerb_cnt && timer->timerb_enable) {
         if (!(timer->status & (1 << 1))) {
           timer->status |= (1 << 1);
-          if (timer->interrupt_cb) timer->interrupt_cb(timer->interrupt_userptr);
+          if (timer->interrupt_cb) {
+            uint32_t t = pfm_prof_begin();
+            timer->interrupt_cb(timer->interrupt_userptr);
+            pfm_prof_end(PFM_PROF_SEQ, t);
+          }
         }
       }
     }

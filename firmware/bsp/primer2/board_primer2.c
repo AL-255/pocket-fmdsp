@@ -14,6 +14,7 @@
 #include "primer2_pins.h"
 #include "songs.h"
 #include "pfm/pfm_config.h"
+#include "pfm/pfm_prof.h"
 #include <stdint.h>
 
 /* ---------------- registers ---------------- */
@@ -247,6 +248,15 @@ static int joy_raw(void) {
   return m;
 }
 
+int board_input_poll(void) { return joy_raw(); }
+
+/* DWT cycle counter (Cortex-M3 core debug) for the render perf meter. */
+#define DEMCR     REG32(0xE000EDFC)
+#define DWT_CTRL  REG32(0xE0001000)
+#define DWT_CYCCNT REG32(0xE0001004)
+uint32_t board_cycles(void) { return DWT_CYCCNT; }
+uint32_t board_cpu_hz(void) { return SYSCLK_HZ; }
+
 int board_input_wait(void) {
   static int prev;
   for (;;) {
@@ -265,28 +275,28 @@ int board_input_wait(void) {
 }
 
 /* ---------------- Audio: STW5094A codec via I2S3 (SPI3) + DMA2_Ch2 ----------
-   Codec config and I2S/DMA setup follow CircleOS audio_spe.c. The player renders
-   at PFM_MIX_RATE (55466 Hz); we linearly resample to the codec's 48 kHz and
-   stream through a DMA ring. board_audio_write() blocks when the ring is full,
-   which paces rendering to real time. Output is routed to the headphone jack
-   only (CR6 bits 0x0c = PHL/PHR); the loudspeaker (bit 0x10) is disabled, since
-   this board has no headphone-detect line to switch automatically. */
+   The circular DMA buffer IS the FIFO between the emulator and the codec:
+     - producer: pfm_player_render() -> board_audio_write() pushes OPNA frames
+       1:1 (no resample); ring_push() stalls (busy-waits) on backpressure when
+       the FIFO is full, so the OPNA runs as fast as it can but no faster.
+     - consumer: DMA2 pops the FIFO at a rock-steady rate set purely by the I2S
+       bit clock (I2S_FS), feeding the codec at exactly that rate.
+   We therefore program the I2S divider so I2S_FS matches the OPNA's native rate
+   (PFM_MIX_RATE = 55467 Hz) as closely as the divider allows -> no resampling.
+   Output is routed to the headphone jack only (CR6 bits 0x0c = PHL/PHR); the
+   loudspeaker (bit 0x10) is off, as this board has no HP-detect line. */
 
-#define AUD_RING 1024                    /* stereo frames in the DMA ring */
-static int16_t g_ring[AUD_RING * 2];     /* interleaved L,R @ ~48 kHz */
+#define AUD_RING 2048                    /* stereo frames in the DMA FIFO (~37 ms) */
+static int16_t g_ring[AUD_RING * 2];     /* interleaved L,R @ I2S_FS */
 static unsigned g_wr;                    /* write cursor (in samples) */
 
-/* Codec sample rate = the actual I2S Fs, SYSCLK / (32 * (2*I2SDIV + ODD)).
-   At SYSCLK=72 MHz with I2SDIV=23,ODD=1 -> 72e6/1504 = 47872 Hz. Resampling to
-   this exact value (not a nominal 48000) keeps the pitch dead-on. */
-#define I2S_I2SDIV 31u
-#define I2S_FS (SYSCLK_HZ / (32u * (2u * I2S_I2SDIV + 1u))) /* 96e6/2016 = 47619 Hz */
-
-/* 55466 -> I2S_FS resampler (source-driven, linear) */
-#define RS_STEP (((uint32_t)PFM_MIX_RATE << 16) / I2S_FS)
-static int16_t rs_fifo[8][2];
-static int rs_cnt;
-static uint32_t rs_pos;
+/* I2S Fs = SYSCLK / (32 * (2*I2SDIV + ODD)). Pick the divider closest to the
+   OPNA rate: at 96 MHz, I2SDIV=27, ODD=0 -> 96e6/(32*54) = 55556 Hz, i.e.
+   PFM_MIX_RATE + 0.16% (~3 cents, inaudible). So the codec consumes exactly
+   what the emulator produces, 1:1. */
+#define I2S_I2SDIV 27u
+#define I2S_ODD    0u
+#define I2S_FS (SYSCLK_HZ / (32u * (2u * I2S_I2SDIV + I2S_ODD))) /* 55556 Hz */
 
 static void i2c_codec_write(const uint8_t *cr, int n) {
   volatile uint32_t t;
@@ -344,7 +354,7 @@ static void i2s_dma_init(void) {
   pin_cfg(GPIOA_BASE, 15, CNF_AF_PP_50); /* I2S3_WS */
 
   SPI3_I2SCFGR = 0;
-  SPI3_I2SPR = I2S_I2SDIV | (1u << 8);   /* I2SDIV, ODD=1 -> I2S_FS from SYSCLK */
+  SPI3_I2SPR = I2S_I2SDIV | (I2S_ODD << 8); /* -> I2S_FS = OPNA rate */
   /* I2SMOD | cfg=master-tx (10) | std=MSB/left-justified (01) | 16-bit */
   SPI3_I2SCFGR = (1u << 11) | (2u << 8) | (1u << 4);
   SPI3_CR2 = (1u << 1);                  /* TXDMAEN */
@@ -369,43 +379,21 @@ static void ring_push(int16_t l, int16_t r) {
   g_wr = next;
 }
 
-static int16_t lerp(int16_t a, int16_t b, uint32_t f) {
-  return (int16_t)(a + (((int)b - (int)a) * (int)f >> 16));
-}
-
 void board_audio_open(unsigned rate, uint32_t total_frames) {
   (void)rate; (void)total_frames;
   for (unsigned i = 0; i < AUD_RING * 2; i++) g_ring[i] = 0;
   g_wr = 0;
-  rs_cnt = 0;
-  rs_pos = 0;
   codec_init();
   i2s_dma_init();
 }
 
+/* Push OPNA frames into the DMA FIFO 1:1 (no resample). ring_push() stalls on
+   backpressure, so this is where the emulator is paced to the codec's rate. */
 void board_audio_write(const int16_t *src, size_t frames) {
-  for (size_t i = 0; i < frames; i++) {
-    if (rs_cnt >= 8) rs_cnt = 7; /* safety */
-    rs_fifo[rs_cnt][0] = src[i * 2 + 0];
-    rs_fifo[rs_cnt][1] = src[i * 2 + 1];
-    rs_cnt++;
-    while ((int)(rs_pos >> 16) + 1 < rs_cnt) {
-      int idx = rs_pos >> 16;
-      uint32_t f = rs_pos & 0xffff;
-      ring_push(lerp(rs_fifo[idx][0], rs_fifo[idx + 1][0], f),
-                lerp(rs_fifo[idx][1], rs_fifo[idx + 1][1], f));
-      rs_pos += RS_STEP;
-    }
-    int consumed = rs_pos >> 16;
-    if (consumed > 0) {
-      for (int k = consumed; k < rs_cnt; k++) {
-        rs_fifo[k - consumed][0] = rs_fifo[k][0];
-        rs_fifo[k - consumed][1] = rs_fifo[k][1];
-      }
-      rs_cnt -= consumed;
-      rs_pos &= 0xffff;
-    }
-  }
+  uint32_t prof_t0 = pfm_prof_begin();
+  for (size_t i = 0; i < frames; i++)
+    ring_push(src[i * 2 + 0], src[i * 2 + 1]);
+  pfm_prof_end(PFM_PROF_OUTPUT, prof_t0);
 }
 
 void board_audio_close(void) {
@@ -444,6 +432,11 @@ void board_log(const char *s) { (void)s; }
 
 void board_init(void) {
   clock_init();
+  /* enable DWT cycle counter (perf meter) */
+  DEMCR |= (1u << 24);      /* TRCENA */
+  DWT_CYCCNT = 0;
+  DWT_CTRL |= 1u;           /* CYCCNTENA */
+  pfm_prof_clock = board_cycles; /* enable per-task CPU profiling */
   /* GPIOA,B,D,E + AFIO clocks */
   RCC_APB2ENR |= (1u << 0) | (1u << 2) | (1u << 3) | (1u << 5) | (1u << 6);
 

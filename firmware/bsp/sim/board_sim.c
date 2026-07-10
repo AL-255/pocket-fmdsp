@@ -101,6 +101,12 @@ int board_input_wait(void) {
   return 0; /* script exhausted -> app exits */
 }
 
+/* Sim has no live input polling; report nothing held so playback runs to its
+   frame limit, and a fixed nominal clock so the perf meter has sane numbers. */
+int board_input_poll(void) { return 0; }
+uint32_t board_cycles(void) { static uint32_t c; return (c += 1000000u); }
+uint32_t board_cpu_hz(void) { return 96000000u; }
+
 /* ---------- audio WAV ---------- */
 static int g_wav_fd = -1, g_wav_no;
 

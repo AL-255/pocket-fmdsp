@@ -37,6 +37,14 @@ void board_lcd_present(void); /* sim: emit a screenshot; real: no-op (GRAM live)
 /* Block until the next joystick event; returns a BTN_* value.
    In the sim this returns the next scripted event, or 0 when the script ends. */
 int board_input_wait(void);
+/* Non-blocking: bitmask of buttons currently held (no debounce/edge). Sim: 0. */
+int board_input_poll(void);
+
+/* ---- perf timing ---- */
+/* Free-running CPU cycle counter (wraps at 2^32) and the core clock in Hz.
+   Used to display a real-time render factor. Sim returns dummy values. */
+uint32_t board_cycles(void);
+uint32_t board_cpu_hz(void);
 
 /* ---- audio out (interleaved stereo int16) ---- */
 void board_audio_open(unsigned samplerate, uint32_t total_frames);

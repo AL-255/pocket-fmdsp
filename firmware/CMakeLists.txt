@@ -44,6 +44,7 @@ target_include_directories(pocketfm_sim PRIVATE
   ${ROOT}/include ${ROOT}/src/opna ${ROOT}/src/driver/vendor
 )
 target_compile_options(pocketfm_sim PRIVATE -Os)
+target_compile_definitions(pocketfm_sim PRIVATE PFM_SIM=1)
 target_link_options(pocketfm_sim PRIVATE
   -T${CMAKE_CURRENT_SOURCE_DIR}/ld/qemu_netduino2.ld
   -Wl,-Map=${CMAKE_BINARY_DIR}/pocketfm_sim.map

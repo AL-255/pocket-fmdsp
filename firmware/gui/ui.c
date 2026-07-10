@@ -3,6 +3,7 @@
 #include "board.h"
 #include "ui_strings.h"
 #include "pfm/pfm_config.h"
+#include "pfm/pfm_prof.h"
 #include "pfm/player.h"
 
 #define W BOARD_LCD_W
@@ -74,15 +75,47 @@ static void draw_list(int sel, int top, int n) {
   gfx_text(2, H - FOOT_H + 2, UI_HINT, COL_TITLE_FG, COL_TITLE_BG);
 }
 
+/* ---- CPU meter: one distinct colour per profiled task ---- */
+#define COL_IDLE rgb565(38, 42, 54)
+#define BAR_H 7
+/* constant-expression RGB565 (rgb565() is an inline fn, not usable in a static
+   initializer) */
+#define RGB_C(r, g, b) \
+  ((uint16_t)((((r) & 0xf8) << 8) | (((g) & 0xfc) << 3) | ((b) >> 3)))
+static const uint16_t task_col[PFM_PROF_N] = {
+  RGB_C(255, 70, 70),   /* FM       */
+  RGB_C(90, 220, 90),   /* SSG      */
+  RGB_C(80, 130, 255),  /* DRUM     */
+  RGB_C(240, 210, 60),  /* PCM      */
+  RGB_C(230, 90, 220),  /* SEQ      */
+  RGB_C(60, 220, 220),  /* RESAMPLE */
+};
+static const char *const task_lbl[PFM_PROF_N] = {
+  "FM", "SSG", "DRUM", "PCM", "SEQ", "OUTPUT",
+};
+
+/* Full bar width = 100% of the real-time CPU budget. Draw each task's share as
+   a coloured segment left-to-right; the leftover to the right is idle headroom.
+   If the tasks overrun 100% the bar saturates and the CPU% reads red. */
+static void draw_cpu_bar(const uint32_t *snap, uint64_t budget) {
+  int x = 0, over = 0;
+  for (int t = 0; t < PFM_PROF_N; t++) {
+    int w = budget ? (int)((uint64_t)snap[t] * W / budget) : 0;
+    if (x + w > W) { w = W - x; over = 1; }
+    if (w > 0) board_lcd_fill_rect(x, 0, w, BAR_H, task_col[t]);
+    x += w;
+    if (x >= W) { over = 1; break; }
+  }
+  if (x < W) board_lcd_fill_rect(x, 0, W - x, BAR_H, COL_IDLE);
+  if (over) board_lcd_fill_rect(W - 2, 0, 2, BAR_H, COL_ERR);
+}
+
 static void play(int sel) {
   board_lcd_clear(COL_BG);
-  board_lcd_fill_rect(0, 0, W, TITLE_H, COL_TITLE_BG);
-  gfx_text(2, 4, UI_NOWPLAYING, COL_TITLE_FG, COL_TITLE_BG);
+  gfx_text(2, BAR_H + 4, UI_NOWPLAYING, COL_TITLE_FG, COL_BG);
   const char *grp = board_storage_group(sel);
-  if (grp && grp[0]) gfx_text(2, 22, grp, COL_SUB_FG, COL_BG);
-  gfx_text_s(2, 36, board_storage_name(sel), COL_FG, COL_BG, 2);
-  gfx_text(2, 60, UI_RENDERING, COL_ACCENT, COL_BG);
-  board_lcd_present();
+  if (grp && grp[0]) gfx_text(2, BAR_H + 16, grp, COL_SUB_FG, COL_BG);
+  gfx_text(2, BAR_H + 28, board_storage_name(sel), COL_FG, COL_BG);
 
   int len = board_storage_load(sel, g_songbuf, sizeof(g_songbuf));
   if (len <= 0) {
@@ -99,36 +132,64 @@ static void play(int sel) {
   }
 
   unsigned rate = PFM_MIX_RATE;
-  uint32_t frames = rate * PLAY_SECONDS;
-  board_audio_open(rate, frames);
+  board_audio_open(rate, 0);
 
-  int peak = 0;
-  for (uint32_t done = 0; done < frames;) {
-    uint32_t n = frames - done;
-    if (n > 1024) n = 1024;
+  /* static legend (colour swatch + task name) */
+  int ly = BAR_H + 60;
+  for (int t = 0; t < PFM_PROF_N; t++) {
+    int yy = ly + t * 12;
+    board_lcd_fill_rect(2, yy, 9, 9, task_col[t]);
+    gfx_text(14, yy + 1, task_lbl[t], COL_FG, COL_BG);
+  }
+  gfx_text(2, H - 10, "any key = stop", COL_NUM, COL_BG);
+  board_lcd_present();
+
+  for (int t = 0; t < PFM_PROF_N; t++) pfm_prof_cyc[t] = 0;
+  uint32_t cpu_hz = board_cpu_hz();
+  uint64_t win_frames = 0;
+  int refresh = 0, armed = 0;
+#ifdef PFM_SIM
+  uint32_t cap = rate * PLAY_SECONDS, done = 0; /* bounded render for the WAV harness */
+#endif
+
+  for (;;) {
+    unsigned n = 1024;
     pfm_player_render(p, g_chunk, n);
     board_audio_write(g_chunk, n);
-    for (uint32_t i = 0; i < n * 2; i++) {
-      int v = g_chunk[i] < 0 ? -g_chunk[i] : g_chunk[i];
-      if (v > peak) peak = v;
-    }
+    win_frames += n;
+#ifdef PFM_SIM
     done += n;
+    if (done >= cap) break;
+#else
+    int b = board_input_poll();
+    if (!armed) { if (!b) armed = 1; }  /* wait for the start-press to lift */
+    else if (b) break;                  /* any press -> back to menu */
+#endif
+
+    if (++refresh >= 8) {
+      refresh = 0;
+      uint32_t snap[PFM_PROF_N];
+      uint64_t sum = 0;
+      for (int t = 0; t < PFM_PROF_N; t++) {
+        snap[t] = pfm_prof_cyc[t];
+        pfm_prof_cyc[t] = 0;
+        sum += snap[t];
+      }
+      uint64_t budget = win_frames * cpu_hz / rate; /* realtime cycles for the window */
+      win_frames = 0;
+      draw_cpu_bar(snap, budget);
+      unsigned pct = budget ? (unsigned)(sum * 100 / budget) : 0;
+      char nb[8];
+      u2a(nb, pct > 999 ? 999 : pct, 3);
+      int cy = BAR_H + 44;
+      board_lcd_fill_rect(2, cy, W - 4, GFX_CH + 2, COL_BG);
+      int xx = gfx_text(2, cy, "CPU ", COL_NUM, COL_BG);
+      xx = gfx_text(xx, cy, nb, pct > 100 ? COL_ERR : COL_OK, COL_BG);
+      gfx_text(xx, cy, "% of realtime", COL_NUM, COL_BG);
+      board_lcd_present();
+    }
   }
   board_audio_close();
-
-  /* now-playing summary: peak VU bar + size/time */
-  board_lcd_fill_rect(0, 58, W, GFX_CH + 2, COL_BG); /* clear "rendering..." line */
-  gfx_text(2, 60, UI_DONE, COL_OK, COL_BG);
-  int barw = (peak * (W - 8)) / 32767;
-  board_lcd_fill_rect(4, 80, W - 8, 8, COL_SUB_BG);
-  board_lcd_fill_rect(4, 80, barw, 8, COL_BAR);
-  char info[24];
-  u2a(info, (unsigned)len, 1);
-  int x = gfx_text(2, 96, "size ", COL_NUM, COL_BG);
-  x = gfx_text(x, 96, info, COL_FG, COL_BG);
-  gfx_text(x, 96, " bytes", COL_NUM, COL_BG);
-  gfx_text(2, 108, "audio -> WAV (semihosting)", COL_NUM, COL_BG);
-  board_lcd_present();
 }
 
 void ui_run(void) {
