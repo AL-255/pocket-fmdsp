@@ -259,8 +259,9 @@ int board_input_wait(void) {
    Codec config and I2S/DMA setup follow CircleOS audio_spe.c. The player renders
    at PFM_MIX_RATE (55466 Hz); we linearly resample to the codec's 48 kHz and
    stream through a DMA ring. board_audio_write() blocks when the ring is full,
-   which paces rendering to real time. Loudspeaker is enabled (CR6 bit 0x10);
-   the headphone jack's switch mutes it when a plug is inserted. */
+   which paces rendering to real time. Output is routed to the headphone jack
+   only (CR6 bits 0x0c = PHL/PHR); the loudspeaker (bit 0x10) is disabled, since
+   this board has no headphone-detect line to switch automatically. */
 
 #define AUD_RING 1024                    /* stereo frames in the DMA ring */
 static int16_t g_ring[AUD_RING * 2];     /* interleaved L,R @ ~48 kHz */
@@ -305,8 +306,8 @@ static void codec_init(void) {
   cr[1] = 0x14;
   cr[4] = 0x6f;
   cr[5] = 0x17;
-  cr[6] = 0x10 | 0x0c | 0x02; /* loudspeaker + headphone + SE, not muted */
-  cr[7] = 0x04;               /* loudspeaker gain */
+  cr[6] = 0x0c | 0x02;        /* headphone (PHL/PHR) + SE, loudspeaker off, not muted */
+  cr[7] = 0x04;               /* output gain */
   cr[8] = 0x14;               /* HP gain L */
   cr[9] = 0x14;               /* HP gain R */
   cr[12] = 0x84;
