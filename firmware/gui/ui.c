@@ -178,14 +178,24 @@ static void play(int sel) {
       uint64_t budget = win_frames * cpu_hz / rate; /* realtime cycles for the window */
       win_frames = 0;
       draw_cpu_bar(snap, budget);
-      unsigned pct = budget ? (unsigned)(sum * 100 / budget) : 0;
       char nb[8];
-      u2a(nb, pct > 999 ? 999 : pct, 3);
+      /* total */
+      unsigned pct = budget ? (unsigned)(sum * 100 / budget) : 0;
       int cy = BAR_H + 44;
       board_lcd_fill_rect(2, cy, W - 4, GFX_CH + 2, COL_BG);
       int xx = gfx_text(2, cy, "CPU ", COL_NUM, COL_BG);
-      xx = gfx_text(xx, cy, nb, pct > 100 ? COL_ERR : COL_OK, COL_BG);
-      gfx_text(xx, cy, "% of realtime", COL_NUM, COL_BG);
+      xx = gfx_text(xx, cy, (u2a(nb, pct > 999 ? 999 : pct, 3), nb),
+                    pct > 100 ? COL_ERR : COL_OK, COL_BG);
+      gfx_text(xx, cy, "% realtime", COL_NUM, COL_BG);
+      /* per-task % next to each legend swatch */
+      for (int t = 0; t < PFM_PROF_N; t++) {
+        unsigned tp = budget ? (unsigned)((uint64_t)snap[t] * 100 / budget) : 0;
+        int yy = ly + t * 12 + 1;
+        u2a(nb, tp > 999 ? 999 : tp, 3);
+        board_lcd_fill_rect(84, yy, W - 84, GFX_CH, COL_BG);
+        int px = gfx_text(84, yy, nb, task_col[t], COL_BG);
+        gfx_text(px, yy, "%", COL_NUM, COL_BG);
+      }
       board_lcd_present();
     }
   }
