@@ -69,3 +69,15 @@ endfunction()
 
 # Stage 1: LED blinky (validates flash + execute)
 add_hw_target(pocketfm_blinky startup/startup.c app/blinky.c)
+
+# Stage 2: the player firmware (FSMC/ST7732 LCD + joystick + songs in flash)
+add_hw_target(pocketfm_hw
+  startup/startup.c
+  bsp/primer2/board_primer2.c
+  gui/gfx.c
+  gui/ui.c
+  app/main_hw.c
+  ${CORE_SRC}
+  ${VENDOR_SRC}
+)
+target_include_directories(pocketfm_hw PRIVATE gen)
