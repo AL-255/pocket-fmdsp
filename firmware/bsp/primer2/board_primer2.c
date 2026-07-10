@@ -88,19 +88,26 @@ static void pin_set(uint32_t base, int pin, int v) {
 }
 static int pin_get(uint32_t base, int pin) { return (GPIO_IDR(base) >> pin) & 1u; }
 
-/* ---------------- clock + delay ---------------- */
+/* ---------------- clock + delay ----------------
+   The STM32 Primer2 has the well-known "ClockBug": its HSE crystal circuit
+   oscillates at 36 MHz, not the nominal 12 MHz (CircleOS detects this and, for
+   72 MHz, multiplies HSE by 2 instead of 6 -- see util_spe2.c). We target the
+   same 72 MHz via HSE x2. (A rare non-bug 12 MHz board would land at 24 MHz;
+   the symptom set here -- responsive GUI + wrong audio pitch -- is the 36 MHz
+   variant running overclocked under the old x6 config.) */
 static void clock_init(void) {
-  RCC_CR |= (1u << 16);                       /* HSEON */
-  for (volatile int t = 0; t < 200000; t++)   /* wait HSERDY, bounded */
-    if (RCC_CR & (1u << 17)) break;
+  RCC_CR |= (1u << 16);                        /* HSEON */
+  for (volatile int t = 0; t < 400000; t++)
+    if (RCC_CR & (1u << 17)) break;            /* HSERDY */
   FLASH_ACR = 0x12;                            /* prefetch + 2 wait states */
-  /* PLLSRC=HSE, PLLXTPRE=0, PLLMUL=x6 (0100), APB1=/2, APB2=/1, AHB=/1 */
-  RCC_CFGR = (1u << 16) | (0x4u << 18) | (0x4u << 8);
+  RCC_CR &= ~(1u << 24);                       /* PLL off while configuring */
+  /* PLLSRC=HSE, PLLXTPRE=0 (HSE undivided), PLLMUL=x2 (0000), APB1=/2 */
+  RCC_CFGR = (1u << 16) | (0x0u << 18) | (0x4u << 8);
   RCC_CR |= (1u << 24);                        /* PLLON */
-  for (volatile int t = 0; t < 200000; t++)
+  for (volatile int t = 0; t < 400000; t++)
     if (RCC_CR & (1u << 25)) break;            /* PLLRDY */
   RCC_CFGR |= 0x2u;                            /* SW = PLL */
-  for (volatile int t = 0; t < 200000; t++)
+  for (volatile int t = 0; t < 400000; t++)
     if ((RCC_CFGR & 0xCu) == 0x8u) break;      /* SWS = PLL */
 }
 

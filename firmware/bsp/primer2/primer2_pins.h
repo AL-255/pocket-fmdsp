@@ -40,11 +40,12 @@
 #define PRIMER2_LCD_CMD_ADDR 0x60000000u
 #define PRIMER2_LCD_DAT_ADDR 0x60020000u
 
-/* Joystick / button pins */
-#define PRIMER2_JOY_LEFT_PIN   3 /* GPIOE */
-#define PRIMER2_JOY_UP_PIN     4 /* GPIOE */
+/* Joystick / button pins (GPIOE). Verified against the physical directions:
+   PE3=UP, PE4=DOWN, PE5=RIGHT, PE6=LEFT. */
+#define PRIMER2_JOY_UP_PIN     3 /* GPIOE */
+#define PRIMER2_JOY_DOWN_PIN   4 /* GPIOE */
 #define PRIMER2_JOY_RIGHT_PIN  5 /* GPIOE */
-#define PRIMER2_JOY_DOWN_PIN   6 /* GPIOE */
+#define PRIMER2_JOY_LEFT_PIN   6 /* GPIOE */
 #define PRIMER2_JOY_CENTER_PIN 8 /* GPIOA (PBUTTON) */
 
 #define PRIMER2_LED0_PIN 0 /* GPIOE */
