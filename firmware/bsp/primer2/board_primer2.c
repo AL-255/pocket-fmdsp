@@ -89,19 +89,29 @@ static void pin_set(uint32_t base, int pin, int v) {
 static int pin_get(uint32_t base, int pin) { return (GPIO_IDR(base) >> pin) & 1u; }
 
 /* ---------------- clock + delay ----------------
-   Primer2 has a 12 MHz HSE crystal -> HSE x6 = 72 MHz SYSCLK. The I2S audio
-   clock is SYSCLK, so this multiplier sets the codec sample rate; at 72 MHz the
-   I2S Fs works out to 47872 Hz (see I2S_FS below), which is what the resampler
-   targets. (An earlier x2 experiment gave 24 MHz -> ~16 kHz Fs, dropping the
-   pitch ~1.5 octaves -- that confirmed this is the standard 12 MHz board.) */
+   Primer2 has a 12 MHz HSE crystal. The STM32F103's rated max is 72 MHz, but the
+   FM render is CPU-bound, so we overclock the core (HCLK = SYSCLK) to 96 MHz for
+   headroom. To keep peripherals within spec we divide the buses down: APB1 = /4
+   = 24 MHz, APB2 = /2 = 48 MHz. Flash stays at 2 wait states + prefetch (out of
+   spec above 72 MHz, but the prefetch buffer covers it at 96 MHz on this part).
+
+   The I2S audio bit clock is derived from SYSCLK, so the codec sample rate moves
+   with it; I2S_FS (below) is computed from SYSCLK_HZ and the resampler targets
+   that exact value, so pitch stays correct at any of these clock choices. To
+   change the overclock, edit PLL_MUL only (and re-check I2S_I2SDIV for ~48 kHz). */
+#define HSE_HZ     12000000u
+#define PLL_MUL    8u                       /* x8 -> 96 MHz (x6 = 72 MHz stock) */
+#define SYSCLK_HZ  (HSE_HZ * PLL_MUL)       /* 96 MHz */
+#define APB1_HZ    (SYSCLK_HZ / 4u)         /* 24 MHz (PPRE1 = /4) */
+
 static void clock_init(void) {
   RCC_CR |= (1u << 16);                        /* HSEON */
   for (volatile int t = 0; t < 400000; t++)
     if (RCC_CR & (1u << 17)) break;            /* HSERDY */
   FLASH_ACR = 0x12;                            /* prefetch + 2 wait states */
   RCC_CR &= ~(1u << 24);                       /* PLL off while configuring */
-  /* PLLSRC=HSE, PLLXTPRE=0 (HSE undivided), PLLMUL=x6 (0100), APB1=/2 */
-  RCC_CFGR = (1u << 16) | (0x4u << 18) | (0x4u << 8);
+  /* PLLSRC=HSE, PLLXTPRE=0, PLLMUL=(PLL_MUL-2), PPRE1=/4 (101), PPRE2=/2 (100) */
+  RCC_CFGR = (1u << 16) | ((PLL_MUL - 2u) << 18) | (0x5u << 8) | (0x4u << 11);
   RCC_CR |= (1u << 24);                        /* PLLON */
   for (volatile int t = 0; t < 400000; t++)
     if (RCC_CR & (1u << 25)) break;            /* PLLRDY */
@@ -111,7 +121,7 @@ static void clock_init(void) {
 }
 
 static void delay_ms(uint32_t ms) {
-  SYST_RVR = 72000u - 1u;
+  SYST_RVR = (SYSCLK_HZ / 1000u) - 1u;
   SYST_CVR = 0;
   SYST_CSR = 5u; /* enable, core clock, no IRQ */
   while (ms--) {
@@ -269,8 +279,8 @@ static unsigned g_wr;                    /* write cursor (in samples) */
 /* Codec sample rate = the actual I2S Fs, SYSCLK / (32 * (2*I2SDIV + ODD)).
    At SYSCLK=72 MHz with I2SDIV=23,ODD=1 -> 72e6/1504 = 47872 Hz. Resampling to
    this exact value (not a nominal 48000) keeps the pitch dead-on. */
-#define I2S_I2SDIV 23u
-#define I2S_FS (72000000u / (32u * (2u * I2S_I2SDIV + 1u))) /* 47872 Hz */
+#define I2S_I2SDIV 31u
+#define I2S_FS (SYSCLK_HZ / (32u * (2u * I2S_I2SDIV + 1u))) /* 96e6/2016 = 47619 Hz */
 
 /* 55466 -> I2S_FS resampler (source-driven, linear) */
 #define RS_STEP (((uint32_t)PFM_MIX_RATE << 16) / I2S_FS)
@@ -301,9 +311,9 @@ static void codec_init(void) {
   pin_cfg(GPIOB_BASE, 10, CNF_AF_OD_50); /* SCL */
   pin_cfg(GPIOB_BASE, 11, CNF_AF_OD_50); /* SDA */
   I2C2_CR1 = 0;
-  I2C2_CR2 = 36;              /* APB1 = 36 MHz */
-  I2C2_CCR = 180;            /* 100 kHz standard mode */
-  I2C2_TRISE = 37;
+  I2C2_CR2 = APB1_HZ / 1000000u;             /* APB1 clock in MHz (=24) */
+  I2C2_CCR = APB1_HZ / (2u * 100000u);       /* 100 kHz standard mode (=120) */
+  I2C2_TRISE = APB1_HZ / 1000000u + 1u;      /* (=25) */
   I2C2_CR1 = 1;              /* enable */
 
   uint8_t cr[22] = {0};
@@ -334,7 +344,7 @@ static void i2s_dma_init(void) {
   pin_cfg(GPIOA_BASE, 15, CNF_AF_PP_50); /* I2S3_WS */
 
   SPI3_I2SCFGR = 0;
-  SPI3_I2SPR = I2S_I2SDIV | (1u << 8);   /* I2SDIV=23, ODD=1 -> 47872 Hz @72MHz */
+  SPI3_I2SPR = I2S_I2SDIV | (1u << 8);   /* I2SDIV, ODD=1 -> I2S_FS from SYSCLK */
   /* I2SMOD | cfg=master-tx (10) | std=MSB/left-justified (01) | 16-bit */
   SPI3_I2SCFGR = (1u << 11) | (2u << 8) | (1u << 4);
   SPI3_CR2 = (1u << 1);                  /* TXDMAEN */

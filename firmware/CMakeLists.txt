@@ -23,7 +23,10 @@ set(VENDOR_SRC
   ${ROOT}/src/driver/vendor/fmdriver/fmdriver_common.c
   ${ROOT}/src/driver/vendor/fmdriver/ppz8.c
 )
-set_source_files_properties(${VENDOR_SRC} PROPERTIES COMPILE_OPTIONS "-w")
+# The OPNA core + PMD driver are the CPU-bound hot path: build them -O3 for the
+# real-time render (overrides the target-wide -Os). Vendored code also gets -w.
+set_source_files_properties(${CORE_SRC}   PROPERTIES COMPILE_OPTIONS "-O3")
+set_source_files_properties(${VENDOR_SRC} PROPERTIES COMPILE_OPTIONS "-w;-O3")
 
 # ================= QEMU / semihosting simulator firmware =================
 add_executable(pocketfm_sim
