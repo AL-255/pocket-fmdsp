@@ -89,20 +89,19 @@ static void pin_set(uint32_t base, int pin, int v) {
 static int pin_get(uint32_t base, int pin) { return (GPIO_IDR(base) >> pin) & 1u; }
 
 /* ---------------- clock + delay ----------------
-   The STM32 Primer2 has the well-known "ClockBug": its HSE crystal circuit
-   oscillates at 36 MHz, not the nominal 12 MHz (CircleOS detects this and, for
-   72 MHz, multiplies HSE by 2 instead of 6 -- see util_spe2.c). We target the
-   same 72 MHz via HSE x2. (A rare non-bug 12 MHz board would land at 24 MHz;
-   the symptom set here -- responsive GUI + wrong audio pitch -- is the 36 MHz
-   variant running overclocked under the old x6 config.) */
+   Primer2 has a 12 MHz HSE crystal -> HSE x6 = 72 MHz SYSCLK. The I2S audio
+   clock is SYSCLK, so this multiplier sets the codec sample rate; at 72 MHz the
+   I2S Fs works out to 47872 Hz (see I2S_FS below), which is what the resampler
+   targets. (An earlier x2 experiment gave 24 MHz -> ~16 kHz Fs, dropping the
+   pitch ~1.5 octaves -- that confirmed this is the standard 12 MHz board.) */
 static void clock_init(void) {
   RCC_CR |= (1u << 16);                        /* HSEON */
   for (volatile int t = 0; t < 400000; t++)
     if (RCC_CR & (1u << 17)) break;            /* HSERDY */
   FLASH_ACR = 0x12;                            /* prefetch + 2 wait states */
   RCC_CR &= ~(1u << 24);                       /* PLL off while configuring */
-  /* PLLSRC=HSE, PLLXTPRE=0 (HSE undivided), PLLMUL=x2 (0000), APB1=/2 */
-  RCC_CFGR = (1u << 16) | (0x0u << 18) | (0x4u << 8);
+  /* PLLSRC=HSE, PLLXTPRE=0 (HSE undivided), PLLMUL=x6 (0100), APB1=/2 */
+  RCC_CFGR = (1u << 16) | (0x4u << 18) | (0x4u << 8);
   RCC_CR |= (1u << 24);                        /* PLLON */
   for (volatile int t = 0; t < 400000; t++)
     if (RCC_CR & (1u << 25)) break;            /* PLLRDY */
@@ -267,8 +266,14 @@ int board_input_wait(void) {
 static int16_t g_ring[AUD_RING * 2];     /* interleaved L,R @ ~48 kHz */
 static unsigned g_wr;                    /* write cursor (in samples) */
 
-/* 55466 -> 48000 resampler (source-driven, linear) */
-#define RS_STEP (((uint32_t)PFM_MIX_RATE << 16) / 48000u)
+/* Codec sample rate = the actual I2S Fs, SYSCLK / (32 * (2*I2SDIV + ODD)).
+   At SYSCLK=72 MHz with I2SDIV=23,ODD=1 -> 72e6/1504 = 47872 Hz. Resampling to
+   this exact value (not a nominal 48000) keeps the pitch dead-on. */
+#define I2S_I2SDIV 23u
+#define I2S_FS (72000000u / (32u * (2u * I2S_I2SDIV + 1u))) /* 47872 Hz */
+
+/* 55466 -> I2S_FS resampler (source-driven, linear) */
+#define RS_STEP (((uint32_t)PFM_MIX_RATE << 16) / I2S_FS)
 static int16_t rs_fifo[8][2];
 static int rs_cnt;
 static uint32_t rs_pos;
@@ -329,7 +334,7 @@ static void i2s_dma_init(void) {
   pin_cfg(GPIOA_BASE, 15, CNF_AF_PP_50); /* I2S3_WS */
 
   SPI3_I2SCFGR = 0;
-  SPI3_I2SPR = 23 | (1u << 8);           /* I2SDIV=23, ODD=1 -> ~47.9 kHz @72MHz */
+  SPI3_I2SPR = I2S_I2SDIV | (1u << 8);   /* I2SDIV=23, ODD=1 -> 47872 Hz @72MHz */
   /* I2SMOD | cfg=master-tx (10) | std=MSB/left-justified (01) | 16-bit */
   SPI3_I2SCFGR = (1u << 11) | (2u << 8) | (1u << 4);
   SPI3_CR2 = (1u << 1);                  /* TXDMAEN */
