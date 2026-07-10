@@ -6,3 +6,5 @@ sim_shot_*.ppm
 sim_play_*.wav
 sim_tracklist.txt
 sim_input.txt
+firmware/gen/
+*.crdownload
