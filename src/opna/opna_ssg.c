@@ -57,72 +57,68 @@ static int env_period(const struct opna_ssg *ssg) {
 }
 static bool chan_env(const struct opna_ssg *ssg, int ch) { return ssg->regs[0x8 + ch] & 0x10; }
 static int tone_volume(const struct opna_ssg *ssg, int ch) { return ssg->regs[0x8 + ch] & 0xf; }
-static int env_level_val(const struct opna_ssg *ssg) {
-  return ssg->env_att ? ssg->env_level : 31 - ssg->env_level;
-}
-static int channel_level(const struct opna_ssg *ssg, int ch) {
-  return chan_env(ssg, ch) ? env_level_val(ssg) : (tone_volume(ssg, ch) << 1) + 1;
-}
-static bool tone_out_ymf288(const struct opna_ssg *ssg, int ch) {
-  unsigned reg = ssg->regs[0x7] >> ch;
-  bool toneout = tone_period(ssg, ch) < 8 ? true : ssg->tone_out[ch];
-  return (toneout || (reg & 0x1)) && ((ssg->lfsr & 1) || (reg & 0x8));
-}
-static bool tone_silent(const struct opna_ssg *ssg, int ch) {
-  unsigned reg = ssg->regs[0x7] >> ch;
-  return (reg & 0x1) && (reg & 0x8);
-}
-
-/* Generate one raw SSG sample (3 channels), advancing all dividers. */
-static void ssg_raw_sample(struct opna_ssg *ssg, int16_t out[3]) {
-  if (((++ssg->noise_counter) >> 1) >= (unsigned)noise_period(ssg)) {
-    ssg->noise_counter = 0;
-    ssg->lfsr |= (!((ssg->lfsr & 1) ^ ((ssg->lfsr >> 3) & 1))) << 17;
-    ssg->lfsr >>= 1;
-  }
-  if (!ssg->env_holding) {
-    if (++ssg->env_counter >= (unsigned)env_period(ssg)) {
-      ssg->env_counter = 0;
-      ssg->env_level++;
-      if (ssg->env_level == 0x20) {
-        ssg->env_level = 0;
-        if (ssg->env_alt) ssg->env_att = !ssg->env_att;
-        if (ssg->env_hld) {
-          ssg->env_level = 0x1f;
-          ssg->env_holding = true;
-        }
-      }
-    }
-  }
-  for (int ch = 0; ch < 3; ch++) {
-    if (++ssg->tone_counter[ch] >= tone_period(ssg, ch)) {
-      ssg->tone_counter[ch] = 0;
-      ssg->tone_out[ch] = !ssg->tone_out[ch];
-    }
-    int level = channel_level(ssg, ch);
-    if (!tone_silent(ssg, ch)) {
-      out[ch] = tone_out_ymf288(ssg, ch) ? voltable[level] : -(int)voltable[level];
-    } else {
-      out[ch] = voltable[level] * 2;
-    }
-  }
-}
+/* (channel_level/tone_out_ymf288/tone_silent inlined into opna_ssg_mix) */
 
 #define RINGMASK (PFM_SSG_RING - 1)
 #define BUFINDEX(idx, n) ((((idx) >> 1) + (n)) & RINGMASK)
 
 PFM_HOT void opna_ssg_mix(struct opna_ssg *ssg, struct opna_ssg_resampler *r,
                   int16_t *buf, unsigned samples) {
+  /* Hoist everything derived only from the (mix-invariant) register file out of
+     the 4.5x-oversampled inner loop. Only counters / lfsr / env level mutate. */
+  const unsigned tp0 = tone_period(ssg, 0), tp1 = tone_period(ssg, 1), tp2 = tone_period(ssg, 2);
+  const unsigned np = (unsigned)noise_period(ssg);
+  const unsigned ep = (unsigned)env_period(ssg);
+  const unsigned reg7 = ssg->regs[0x7];
+  const bool cenv0 = chan_env(ssg, 0), cenv1 = chan_env(ssg, 1), cenv2 = chan_env(ssg, 2);
+  const int tv0 = (tone_volume(ssg, 0) << 1) + 1, tv1 = (tone_volume(ssg, 1) << 1) + 1,
+            tv2 = (tone_volume(ssg, 2) << 1) + 1;
+  const unsigned tdis0 = reg7 & 1, tdis1 = (reg7 >> 1) & 1, tdis2 = (reg7 >> 2) & 1;
+  const unsigned ndis0 = (reg7 >> 3) & 1, ndis1 = (reg7 >> 4) & 1, ndis2 = (reg7 >> 5) & 1;
+  const unsigned tp[3] = {tp0, tp1, tp2};
+  const bool cenv[3] = {cenv0, cenv1, cenv2};
+  const int tv[3] = {tv0, tv1, tv2};
+  const unsigned tdis[3] = {tdis0, tdis1, tdis2}, ndis[3] = {ndis0, ndis1, ndis2};
+
   for (unsigned i = 0; i < samples; i++) {
     /* generate the raw samples that fall in this output step (4 or 5) */
     unsigned ssg_samples = ((r->index + 9) >> 1) - (r->index >> 1);
     for (unsigned j = 0; j < ssg_samples; j++) {
-      int16_t s[3];
-      ssg_raw_sample(ssg, s);
-      unsigned pos = BUFINDEX(r->index, j);
-      r->buf[pos * 3 + 0] = s[0];
-      r->buf[pos * 3 + 1] = s[1];
-      r->buf[pos * 3 + 2] = s[2];
+      if (((++ssg->noise_counter) >> 1) >= np) {
+        ssg->noise_counter = 0;
+        ssg->lfsr |= (!((ssg->lfsr & 1) ^ ((ssg->lfsr >> 3) & 1))) << 17;
+        ssg->lfsr >>= 1;
+      }
+      if (!ssg->env_holding) {
+        if (++ssg->env_counter >= ep) {
+          ssg->env_counter = 0;
+          ssg->env_level++;
+          if (ssg->env_level == 0x20) {
+            ssg->env_level = 0;
+            if (ssg->env_alt) ssg->env_att = !ssg->env_att;
+            if (ssg->env_hld) { ssg->env_level = 0x1f; ssg->env_holding = true; }
+          }
+        }
+      }
+      const unsigned lfsr1 = ssg->lfsr & 1;
+      const int envlvl = ssg->env_att ? ssg->env_level : 31 - ssg->env_level;
+      const unsigned pos = BUFINDEX(r->index, j) * 3;
+      for (int ch = 0; ch < 3; ch++) {
+        if (++ssg->tone_counter[ch] >= tp[ch]) {
+          ssg->tone_counter[ch] = 0;
+          ssg->tone_out[ch] = !ssg->tone_out[ch];
+        }
+        int level = cenv[ch] ? envlvl : tv[ch];
+        int16_t o;
+        if (!(tdis[ch] && ndis[ch])) {
+          bool toneout = tp[ch] < 8 ? true : ssg->tone_out[ch];
+          bool on = (toneout || tdis[ch]) && (lfsr1 || ndis[ch]);
+          o = on ? (int16_t)voltable[level] : (int16_t)(-(int)voltable[level]);
+        } else {
+          o = (int16_t)(voltable[level] * 2);
+        }
+        r->buf[pos + ch] = o;
+      }
     }
     r->index += 9;
     r->index &= (2 * PFM_SSG_RING) - 1;

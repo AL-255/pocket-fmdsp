@@ -11,9 +11,14 @@ enum {
   CH3_MODE_SE = 2,
 };
 
+static inline void slot_update_atten(struct opna_fm_slot *slot) {
+  slot->atten_base = (uint16_t)((slot->env << 2) + (slot->tl << 5));
+}
+
 static void opna_fm_slot_reset(struct opna_fm_slot *slot) {
   slot->env = PFM_FM_ENV_MAX;
   slot->env_state = PFM_ENV_RELEASE;
+  slot_update_atten(slot);
 }
 
 static void opna_fm_chan_reset(struct opna_fm_channel *chan) {
@@ -41,8 +46,7 @@ static int16_t opna_fm_slotout(struct opna_fm_slot *slot, int16_t modulation) {
   pind &= (1u << PFM_LOGSINTABLEBIT) - 1;
 
   int logout = pfm_logsintable[pind];
-  logout += slot->env << 2;
-  logout += slot->tl << 5;
+  logout += slot->atten_base;   /* = (env<<2)+(tl<<5), precomputed */
 
   int selector = logout & ((1 << PFM_EXPTABLEBIT) - 1);
   int shifter = logout >> PFM_EXPTABLEBIT;
@@ -232,9 +236,11 @@ PFM_HOT static void opna_fm_slot_setrate(struct opna_fm_slot *slot, int status) 
   }
 }
 
-PFM_HOT static void opna_fm_slot_env(struct opna_fm_slot *slot) {
+/* The actual envelope step (runs only when the rate boundary is hit). Kept out
+   of line so the common per-sample path is just a compare + env_count++. */
+PFM_HOT static void opna_fm_slot_env_step(struct opna_fm_slot *slot) {
   int rate_shifter = slot->rate_shifter;
-  if ((slot->env_count & ((1 << rate_shifter) - 1)) == ((1 << rate_shifter) - 1)) {
+  {
     int rate_index = (slot->env_count >> rate_shifter) & 7;
     int env_inc = pfm_rateinctable[slot->rate_selector][rate_index];
     env_inc *= slot->rate_mul;
@@ -271,7 +277,14 @@ PFM_HOT static void opna_fm_slot_env(struct opna_fm_slot *slot) {
       }
       break;
     }
+    slot_update_atten(slot); /* env changed -> refresh precomputed attenuation */
   }
+}
+
+PFM_HOT static void opna_fm_slot_env(struct opna_fm_slot *slot) {
+  int rs = slot->rate_shifter;
+  if ((slot->env_count & ((1 << rs) - 1)) == ((1 << rs) - 1))
+    opna_fm_slot_env_step(slot);
   slot->env_count++;
 }
 
@@ -375,6 +388,7 @@ void opna_fm_writereg(struct opna_fm *fm, unsigned reg, unsigned val) {
     break;
   case 0x40:
     slot->tl = val & 0x7f;
+    slot_update_atten(slot);
     break;
   case 0x50:
     slot->ks = (val >> 6) & 0x3;
@@ -482,10 +496,15 @@ PFM_HOT void opna_fm_mix(struct opna_fm *fm, int16_t *buf, unsigned samples) {
     if (!fm->env_div3) {
       for (int c = 0; c < 6; c++) {
         for (int s = 0; s < 4; s++) {
-          if (fm->channel[c].slot[s].keyon_ext) {
-            fm->channel[c].slot[s].keyon_ext = false;
+          struct opna_fm_slot *sl = &fm->channel[c].slot[s];
+          if (sl->keyon_ext) {
+            sl->keyon_ext = false;
           } else {
-            opna_fm_slot_env(&fm->channel[c].slot[s]);
+            /* inline the boundary test; only the rare actual step is a call */
+            int rs = sl->rate_shifter;
+            if ((sl->env_count & ((1 << rs) - 1)) == ((1 << rs) - 1))
+              opna_fm_slot_env_step(sl);
+            sl->env_count++;
           }
         }
       }
