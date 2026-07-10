@@ -468,7 +468,7 @@ static inline bool chan_is_silent(const struct opna_fm_channel *chan) {
 PFM_HOT void opna_fm_mix(struct opna_fm *fm, int16_t *buf, unsigned samples) {
   for (unsigned i = 0; i < samples; i++) {
     if (!fm->env_div3) {
-      for (int c = 0; c < 6; c++) {
+      for (int c = 0; c < PFM_FM_CH; c++) {
         for (int s = 0; s < 4; s++) {
           if (fm->channel[c].slot[s].keyon_ext) {
             opna_fm_slot_key(&fm->channel[c], s, true);
@@ -481,7 +481,7 @@ PFM_HOT void opna_fm_mix(struct opna_fm *fm, int16_t *buf, unsigned samples) {
     int32_t lo = buf[i * 2 + 0];
     int32_t ro = buf[i * 2 + 1];
 
-    for (int c = 0; c < 6; c++) {
+    for (int c = 0; c < PFM_FM_CH; c++) {
       if (chan_is_silent(&fm->channel[c])) continue; /* contributes 0, no state change */
       struct fm_frame o = opna_fm_chanout(&fm->channel[c]);
       opna_fm_chan_phase(&fm->channel[c]);
@@ -494,7 +494,7 @@ PFM_HOT void opna_fm_mix(struct opna_fm *fm, int16_t *buf, unsigned samples) {
     buf[i * 2 + 1] = (int16_t)pfm_clamp16(ro);
 
     if (!fm->env_div3) {
-      for (int c = 0; c < 6; c++) {
+      for (int c = 0; c < PFM_FM_CH; c++) {
         for (int s = 0; s < 4; s++) {
           struct opna_fm_slot *sl = &fm->channel[c].slot[s];
           if (sl->keyon_ext) {

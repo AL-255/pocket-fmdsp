@@ -24,6 +24,13 @@
 #define PFM_RAMDATA
 #endif
 
+/* Number of FM channels to render: 6 = YM2608 (OPNA, PC-9801-86), 3 = YM2203
+   (OPN, PC-9801-26K). Rendering 3 is the OPN subset of the OPNA and halves the
+   FM mix + envelope cost; OPNA-only songs lose FM ch4-6, as on a real 26K. */
+#ifndef PFM_FM_CH
+#define PFM_FM_CH 6
+#endif
+
 /* OPNA master clock (YM2608 on PC-98). */
 #define PFM_OPNA_MASTER_CLOCK 7987200u
 

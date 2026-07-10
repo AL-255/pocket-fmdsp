@@ -87,3 +87,5 @@ add_hw_target(pocketfm_hw
 target_include_directories(pocketfm_hw PRIVATE gen)
 # place the per-sample render functions in 0-wait SRAM (.ramfunc)
 target_compile_definitions(pocketfm_hw PRIVATE PFM_RAMFUNC=1)
+# emulate YM2203 (OPN, PC-9801-26K): 3 FM channels instead of the OPNA's 6
+target_compile_definitions(pocketfm_hw PRIVATE PFM_FM_CH=3)
