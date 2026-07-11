@@ -16,6 +16,10 @@
 #define ROW_H 11
 #define VISROWS 10
 #define FOOT_H 12
+/* bottom of every page: a control-hint bar, then a tab bar (File/Play/Config) */
+#define TAB_H 9
+#define TABBAR_Y (H - TAB_H)       /* current-tab bar sits at the very bottom */
+#define HINT_Y (H - 2 * TAB_H)     /* control-hint bar sits just above it */
 
 #define PLAY_SECONDS 6
 
@@ -136,7 +140,7 @@ static void draw_cpu_bar(const uint32_t *snap, uint64_t budget) {
 }
 
 static void draw_vol(int vol) {
-  int y = H - 22;
+  int y = HINT_Y - 11;
   board_lcd_fill_rect(2, y, W - 4, GFX_CH + 1, COL_BG);
   char b[4];
   u2a(b, vol, 2);
@@ -377,6 +381,20 @@ static void draw_dbg(void) {
   board_lcd_fill_rect(2, PLAY_DBG_Y + 11, W - 4, GFX_CH, COL_BG);
   gfx_text(2, PLAY_DBG_Y + 11, s, COL_NUM, COL_BG);
 }
+/* Bottom tab bar: File / Play / Config, current page highlighted. */
+static void draw_tab_bar(void) {
+  static const char *const tabn[PG_N] = { "File", "Play", "Config" };
+  int tw = W / PG_N;
+  for (int t = 0; t < PG_N; t++) {
+    int x = t * tw, w = (t == PG_N - 1) ? (W - x) : tw;
+    int on = (t == g_page);
+    uint16_t bg = on ? COL_SEL_BG : COL_SUB_BG;
+    uint16_t fg = on ? COL_SEL_FG : COL_NUM;
+    board_lcd_fill_rect(x, TABBAR_Y, w, TAB_H, bg);
+    int tx = x + (tw - (int)strlen(tabn[t]) * 4) / 2;   /* centre (4px glyphs) */
+    gfx_text(tx, TABBAR_Y + 1, tabn[t], fg, bg);
+  }
+}
 static void draw_play_chrome(void) {
   board_lcd_clear(COL_BG);
   gfx_text(2, PLAY_TITLE_Y, g_cur_title[0] ? g_cur_title : "(no title)", COL_TITLE_FG, COL_BG);
@@ -391,7 +409,8 @@ static void draw_play_chrome(void) {
   }
   draw_vol(g_volume);
   draw_dbg();
-  gfx_text(2, H - 10, "holdC pages UDvol LRsong", COL_NUM, COL_BG);
+  gfx_text(2, HINT_Y + 1, "holdC page UDvol LRsong", COL_NUM, COL_BG);
+  draw_tab_bar();
   board_lcd_present();
 }
 static void draw_play_page(void) {   /* run only on the lcd task */
@@ -430,8 +449,9 @@ static void draw_browser_full(void) {
     gfx_text(2, LIST_Y + 4, m, COL_ERR, COL_BG);
     gfx_text(2, LIST_Y + 16, "hold C = other pages", COL_NUM, COL_BG);
   }
-  board_lcd_fill_rect(0, H - FOOT_H, W, FOOT_H, COL_TITLE_BG);
-  gfx_text(2, H - FOOT_H + 2, "UD sel  LR dir  C play", COL_TITLE_FG, COL_TITLE_BG);
+  board_lcd_fill_rect(0, HINT_Y, W, TAB_H, COL_TITLE_BG);
+  gfx_text(2, HINT_Y + 1, "UD sel  LR dir  C play", COL_TITLE_FG, COL_TITLE_BG);
+  draw_tab_bar();
   if (g_have_sd) draw_browser_rows();
   else board_lcd_present();
 }
@@ -478,8 +498,9 @@ static void draw_settings_full(void) {
   board_lcd_clear(COL_BG);
   board_lcd_fill_rect(0, 0, W, TITLE_H, COL_TITLE_BG);
   gfx_text(2, 4, "Settings", COL_TITLE_FG, COL_TITLE_BG);
-  board_lcd_fill_rect(0, H - FOOT_H, W, FOOT_H, COL_TITLE_BG);
-  gfx_text(2, H - FOOT_H + 2, "UD move  C open/mute", COL_TITLE_FG, COL_TITLE_BG);
+  board_lcd_fill_rect(0, HINT_Y, W, TAB_H, COL_TITLE_BG);
+  gfx_text(2, HINT_Y + 1, "UD move  LR open  C set", COL_TITLE_FG, COL_TITLE_BG);
+  draw_tab_bar();
   draw_settings_rows();
 }
 
