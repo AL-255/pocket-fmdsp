@@ -2,6 +2,12 @@
 #include "fmdriver_common.h"
 #include <string.h>
 #include "ppz8-sinctable.inc"
+/* PFM_HOT: run ppz8_mix (PCM) from 0-wait SRAM on the overclocked hw target. */
+#ifdef PFM_RAMFUNC
+#define PFM_HOT __attribute__((section(".ramfunc")))
+#else
+#define PFM_HOT
+#endif
 
 unsigned ppz8_get_mask(const struct ppz8 *ppz8) {
   return ppz8->mask;
@@ -180,7 +186,7 @@ static int32_t ppz8_channel_calc(struct ppz8 *ppz8, struct ppz8_channel *channel
   return out;
 }
 
-void ppz8_mix(struct ppz8 *ppz8, int16_t *buf, unsigned samples) {
+PFM_HOT void ppz8_mix(struct ppz8 *ppz8, int16_t *buf, unsigned samples) {
   unsigned level[8] = {0};
   static const uint8_t pan_vol[10][2] = {
     {0, 0},

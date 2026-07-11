@@ -52,7 +52,7 @@ void opna_timer_writereg(struct opna_timer *timer, unsigned reg, unsigned val) {
   }
 }
 
-void opna_timer_mix(struct opna_timer *timer, int16_t *buf, unsigned samples) {
+PFM_HOT void opna_timer_mix(struct opna_timer *timer, int16_t *buf, unsigned samples) {
   do {
     unsigned generate_samples = samples;
     if (timer->timerb_enable && timer->timerb_load) {

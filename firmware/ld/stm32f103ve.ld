@@ -59,7 +59,9 @@ SECTIONS
     _edata = .;
   } >RAM AT> FLASH
 
-  /* Hot render code copied into 0-wait SRAM (flash is under-spec at 96 MHz). */
+  /* The entire per-sample render path runs from 0-wait SRAM (functions tagged
+     PFM_HOT): FM/SSG/drum/PCM mixers + timer slicing. Only cold code (UI, PMD
+     sequencer, register writes, init) stays in the under-spec flash. */
   .ramfunc :
   {
     . = ALIGN(4);

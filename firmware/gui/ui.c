@@ -34,8 +34,8 @@
 #define COL_ERR       rgb565(255, 110, 110)
 #define COL_BAR       rgb565(120, 230, 160)
 
-static uint8_t g_songbuf[24 * 1024];
-static int16_t g_chunk[1024 * 2];
+static uint8_t g_songbuf[22 * 1024]; /* >= SONG_MAX_LEN (21071); rest freed for .ramfunc */
+static int16_t g_chunk[512 * 2];
 
 static void u2a(char *d, unsigned v, int width) { /* right-aligned decimal */
   char t[8];
@@ -153,7 +153,7 @@ static void play(int sel) {
 #endif
 
   for (;;) {
-    unsigned n = 1024;
+    unsigned n = 512;
     pfm_player_render(p, g_chunk, n);
     board_audio_write(g_chunk, n);
     win_frames += n;

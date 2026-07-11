@@ -75,7 +75,7 @@ void pfm_player_set_drumrom(pfm_player *p, const uint8_t *rom8k) {
   opna_drum_set_rom(&p->opna.drum, rom8k);
 }
 
-void pfm_player_render(pfm_player *p, int16_t *buf, size_t frames) {
+PFM_HOT void pfm_player_render(pfm_player *p, int16_t *buf, size_t frames) {
   while (frames) {
     unsigned n = frames > 4096 ? 4096 : (unsigned)frames;
     opna_timer_mix(&p->timer, buf, n);

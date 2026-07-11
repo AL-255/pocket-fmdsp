@@ -101,11 +101,9 @@ static int pin_get(uint32_t base, int pin) { return (GPIO_IDR(base) >> pin) & 1u
    that exact value, so pitch stays correct at any of these clock choices. To
    change the overclock, edit PLL_MUL only (and re-check I2S_I2SDIV for ~48 kHz). */
 #define HSE_HZ     12000000u
-#define PLL_MUL    8u                        /* x8 -> 96 MHz (x6 = 72 MHz stock).
-   96 MHz is the practical ceiling: above it the flash (2 wait-states max) is too
-   slow for the cold code that still executes from flash at boot/UI/playback. */
-#define SYSCLK_HZ  (HSE_HZ * PLL_MUL)       /* 96 MHz */
-#define APB1_HZ    (SYSCLK_HZ / 4u)         /* 24 MHz (PPRE1 = /4) */
+#define PLL_MUL    11u                       /* overclock search: x11 -> 132 MHz */
+#define SYSCLK_HZ  (HSE_HZ * PLL_MUL)       /* 132 MHz */
+#define APB1_HZ    (SYSCLK_HZ / 4u)         /* 33 MHz (PPRE1 = /4) */
 
 static void clock_init(void) {
   RCC_CR |= (1u << 16);                        /* HSEON */
@@ -296,9 +294,9 @@ static unsigned g_wr;                    /* write cursor (in samples) */
    OPNA rate: at 96 MHz, I2SDIV=27, ODD=0 -> 96e6/(32*54) = 55556 Hz, i.e.
    PFM_MIX_RATE + 0.16% (~3 cents, inaudible). So the codec consumes exactly
    what the emulator produces, 1:1. */
-#define I2S_I2SDIV 27u
-#define I2S_ODD    0u   /* 2*27+0 = 54 -> 96e6/(32*54) = 55555.6 Hz (= OPNA rate) */
-#define I2S_FS (SYSCLK_HZ / (32u * (2u * I2S_I2SDIV + I2S_ODD))) /* 55556 Hz */
+#define I2S_I2SDIV 37u
+#define I2S_ODD    0u   /* 2*37+0 = 74 -> 132e6/(32*74) = 55743 Hz (~OPNA rate, +0.5%) */
+#define I2S_FS (SYSCLK_HZ / (32u * (2u * I2S_I2SDIV + I2S_ODD))) /* 55743 Hz */
 
 static void i2c_codec_write(const uint8_t *cr, int n) {
   volatile uint32_t t;
@@ -382,10 +380,9 @@ void board_audio_open(unsigned rate, uint32_t total_frames) {
 }
 
 /* Push OPNA frames into the DMA FIFO 1:1 (no resample). Copies in contiguous
-   runs, reading the DMA position only once per run instead of per frame (that
-   volatile AHB read, contended by the active DMA, was the whole cost before).
-   Spins only when the FIFO is genuinely full, so it still paces to codec rate. */
-void board_audio_write(const int16_t *src, size_t frames) {
+   runs, reading the DMA position only once per run instead of per frame. In
+   SRAM (.ramfunc): the copy loop must not run from the under-spec flash. */
+PFM_HOT void board_audio_write(const int16_t *src, size_t frames) {
   uint32_t prof_t0 = pfm_prof_begin();
   const unsigned size = AUD_RING * 2;         /* samples in the ring */
   size_t total = frames * 2, done = 0;

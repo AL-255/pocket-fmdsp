@@ -27,7 +27,7 @@ unsigned opna_readreg(const struct opna *opna, unsigned reg) {
 uint32_t pfm_prof_cyc[PFM_PROF_N];
 uint32_t (*pfm_prof_clock)(void);
 
-void opna_mix(struct opna *opna, int16_t *buf, unsigned samples) {
+PFM_HOT void opna_mix(struct opna *opna, int16_t *buf, unsigned samples) {
   uint32_t t;
   memset(buf, 0, (size_t)samples * 2 * sizeof(int16_t));
   t = pfm_prof_begin(); opna_fm_mix(&opna->fm, buf, samples);

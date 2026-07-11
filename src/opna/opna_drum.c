@@ -99,7 +99,7 @@ void opna_drum_writereg(struct opna_drum *drum, unsigned reg, unsigned val) {
   }
 }
 
-void opna_drum_mix(struct opna_drum *drum, int16_t *buf, unsigned samples) {
+PFM_HOT void opna_drum_mix(struct opna_drum *drum, int16_t *buf, unsigned samples) {
   if (!drum->rom) return;
   for (unsigned i = 0; i < samples; i++) {
     int32_t lo = buf[i * 2 + 0];
