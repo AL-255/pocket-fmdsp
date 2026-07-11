@@ -133,6 +133,12 @@ static void draw_play_chrome(int sel) {
   const char *grp = board_storage_group(sel);
   if (grp && grp[0]) gfx_text(2, BAR_H + 16, grp, COL_SUB_FG, COL_BG);
   gfx_text(2, BAR_H + 28, board_storage_name(sel), COL_FG, COL_BG);
+  { /* static labels; only the two numbers are redrawn each meter tick */
+    int cy = BAR_H + 44;
+    gfx_text(2, cy, "CPU", COL_NUM, COL_BG);
+    gfx_text(30, cy, "%", COL_NUM, COL_BG);
+    gfx_text(40, cy, "DR", COL_NUM, COL_BG);
+  }
   for (int t = 0; t < PFM_PROF_N; t++) {
     int yy = PLAY_LEGEND_Y + t * 12;
     board_lcd_fill_rect(2, yy, 9, 9, task_col[t]);
@@ -229,27 +235,18 @@ static int play(int sel) {
       }
       uint64_t budget = win_frames * cpu_hz / rate; /* realtime cycles for the window */
       win_frames = 0;
-      if (g_lcd_on) {                 /* skip all LCD writes when toggled off */
+      if (g_lcd_on) {                 /* minimal dynamic draw: bar + two numbers */
         draw_cpu_bar(snap, budget);
         char nb[8];
-        unsigned pct = budget ? (unsigned)(sum * 100 / budget) : 0;
         int cy = BAR_H + 44;
-        board_lcd_fill_rect(2, cy, W - 4, GFX_CH + 2, COL_BG);
-        int xx = gfx_text(2, cy, "CPU ", COL_NUM, COL_BG);
+        unsigned pct = budget ? (unsigned)(sum * 100 / budget) : 0;
         u2a(nb, pct > 999 ? 999 : pct, 3);
-        xx = gfx_text(xx, cy, nb, pct > 100 ? COL_ERR : COL_OK, COL_BG);
-        xx = gfx_text(xx, cy, "% DROP ", COL_NUM, COL_BG);
+        board_lcd_fill_rect(16, cy, 13, GFX_CH, COL_BG);
+        gfx_text(16, cy, nb, pct > 100 ? COL_ERR : COL_OK, COL_BG);
         unsigned drops = board_audio_underruns();
         u2a(nb, drops > 9999 ? 9999 : drops, 1);
-        gfx_text(xx, cy, nb, drops ? COL_ERR : COL_OK, COL_BG);
-        for (int t = 0; t < PFM_PROF_N; t++) {
-          unsigned tp = budget ? (unsigned)((uint64_t)snap[t] * 100 / budget) : 0;
-          int yy = PLAY_LEGEND_Y + t * 12 + 1;
-          u2a(nb, tp > 999 ? 999 : tp, 3);
-          board_lcd_fill_rect(84, yy, W - 84, GFX_CH, COL_BG);
-          int px = gfx_text(84, yy, nb, task_col[t], COL_BG);
-          gfx_text(px, yy, "%", COL_NUM, COL_BG);
-        }
+        board_lcd_fill_rect(50, cy, 20, GFX_CH, COL_BG);
+        gfx_text(50, cy, nb, drops ? COL_ERR : COL_OK, COL_BG);
         board_lcd_present();
       }
     }
