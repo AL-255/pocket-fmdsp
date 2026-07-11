@@ -100,5 +100,7 @@ target_include_directories(pocketfm_hw PRIVATE gen
   freertos freertos/include freertos/portable fatfs)
 # place the per-sample render functions in 0-wait SRAM (.ramfunc)
 target_compile_definitions(pocketfm_hw PRIVATE PFM_RAMFUNC=1 PFM_RTOS=1)
-# emulate YM2203 (OPN, PC-9801-26K): 3 FM channels instead of the OPNA's 6
-target_compile_definitions(pocketfm_hw PRIVATE PFM_FM_CH=3)
+# Render all 6 OPNA FM channels; the Settings menu mutes FM3-5 by default so the
+# out-of-the-box CPU cost matches a 3-channel (PC-9801-26K) render, but the user
+# can enable the extra channels per-song. Muted channels are bypassed in the mix.
+target_compile_definitions(pocketfm_hw PRIVATE PFM_FM_CH=6)

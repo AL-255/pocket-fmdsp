@@ -203,12 +203,34 @@ static int b_sel, b_top, b_count;
 static char g_play_path[256];    /* dir the playing song lives in (for prev/next) */
 static int  g_play_idx;
 
-/* --- settings --- */
-#define NSET 5
-static const char *const set_lbl[NSET] = { "Output", "FM", "SSG", "Drum", "PCM" };
-static int st_sel;
-static uint8_t g_out_speaker;    /* 0 headphone, 1 loudspeaker */
-static uint8_t g_mute[4] = { 0, 0, 0, 1 }; /* FM, SSG, DRUM, PCM — PCM muted by default */
+/* --- settings: hierarchical per-channel mute tree ---
+   Output, then FM (folds open to FM0..FM5), SSG (folds open to SSG0..SSG2),
+   Drum, PCM. Default enables FM0-2 + SSG0 (a PC-9801-26K-ish voicing at ~3-FM
+   cost); the rest are muted and bypassed until the user turns them on. */
+static uint8_t g_out_speaker;                          /* 0 headphone, 1 loudspeaker */
+static uint8_t g_fm_mute[6]  = { 0, 0, 0, 1, 1, 1 };   /* FM0-2 on, FM3-5 muted */
+static uint8_t g_ssg_mute[3] = { 0, 1, 1 };            /* SSG0 on, SSG1-2 muted */
+static uint8_t g_drum_mute = 0;
+static uint8_t g_pcm_mute  = 1;                        /* ppz8 PCM muted by default */
+static int g_fm_open, g_ssg_open;                      /* folder expansion */
+static int st_sel, st_top;                             /* selection index + scroll top */
+
+enum { K_OUTPUT, K_FM, K_FMCH, K_SSG, K_SSGCH, K_DRUM, K_PCM };
+static struct { uint8_t kind, ch; } g_srow[16];
+static int g_nsrow;
+static void build_srows(void) {
+  int n = 0;
+  g_srow[n].kind = K_OUTPUT; g_srow[n++].ch = 0;
+  g_srow[n].kind = K_FM;     g_srow[n++].ch = 0;
+  if (g_fm_open) for (int c = 0; c < 6; c++) { g_srow[n].kind = K_FMCH; g_srow[n++].ch = c; }
+  g_srow[n].kind = K_SSG;    g_srow[n++].ch = 0;
+  if (g_ssg_open) for (int c = 0; c < 3; c++) { g_srow[n].kind = K_SSGCH; g_srow[n++].ch = c; }
+  g_srow[n].kind = K_DRUM;   g_srow[n++].ch = 0;
+  g_srow[n].kind = K_PCM;    g_srow[n++].ch = 0;
+  g_nsrow = n;
+}
+static int fm_on_count(void) { int n = 0; for (int c = 0; c < 6; c++) if (!g_fm_mute[c]) n++; return n; }
+static int ssg_on_count(void) { int n = 0; for (int c = 0; c < 3; c++) if (!g_ssg_mute[c]) n++; return n; }
 
 /* ---------- SD directory helpers ---------- */
 static int sd_dir_count(void) {
@@ -416,22 +438,40 @@ static void draw_browser_full(void) {
 static void browse_reload(void) { b_count = src_count(); b_sel = 0; b_top = 0; }
 
 /* ---------- settings screen ---------- */
-static void set_value_str(int i, char *out) {
-  if (i == 0) strcpy(out, g_out_speaker ? "Speaker" : "Phones");
-  else strcpy(out, g_mute[i - 1] ? "Mute" : "On");
+static void draw_srow(int r) {   /* r = visible row 0..VISROWS-1 */
+  int idx = st_top + r, y = LIST_Y + r * ROW_H;
+  int sel = (idx == st_sel);
+  uint16_t bg = sel ? COL_SEL_BG : COL_BG;
+  board_lcd_fill_rect(0, y, W, ROW_H, bg);
+  if (idx >= g_nsrow) return;
+  uint16_t fg = sel ? COL_SEL_FG : COL_FG;
+  int kind = g_srow[idx].kind, ch = g_srow[idx].ch;
+  char lbl[10], val[10];
+  int indent = 4, folder = 0, muted = 0;
+  switch (kind) {
+  case K_OUTPUT: strcpy(lbl, "Output"); strcpy(val, g_out_speaker ? "Speaker" : "Phones"); break;
+  case K_FM:  folder = 1; strcpy(lbl, g_fm_open ? "-FM" : "+FM");
+              val[0] = '0' + fm_on_count(); val[1] = '/'; val[2] = '6'; val[3] = 0; break;
+  case K_SSG: folder = 1; strcpy(lbl, g_ssg_open ? "-SSG" : "+SSG");
+              val[0] = '0' + ssg_on_count(); val[1] = '/'; val[2] = '3'; val[3] = 0; break;
+  case K_FMCH:  indent = 14; lbl[0] = 'F'; lbl[1] = 'M'; lbl[2] = '0' + ch; lbl[3] = 0;
+                muted = g_fm_mute[ch]; strcpy(val, muted ? "Mute" : "On"); break;
+  case K_SSGCH: indent = 14; strcpy(lbl, "SSG"); lbl[3] = '0' + ch; lbl[4] = 0;
+                muted = g_ssg_mute[ch]; strcpy(val, muted ? "Mute" : "On"); break;
+  case K_DRUM: strcpy(lbl, "Drum"); muted = g_drum_mute; strcpy(val, muted ? "Mute" : "On"); break;
+  case K_PCM:  strcpy(lbl, "PCM"); muted = g_pcm_mute; strcpy(val, muted ? "Mute" : "On"); break;
+  }
+  gfx_text(indent, y + 1, lbl, fg, bg);
+  uint16_t vc = sel ? COL_SEL_FG : (folder ? COL_SUB_FG : (muted ? COL_ERR : COL_ACCENT));
+  gfx_text(70, y + 1, val, vc, bg);
 }
 static void draw_settings_rows(void) {
-  for (int r = 0; r < NSET; r++) {
-    int y = LIST_Y + r * ROW_H;
-    int sel = (r == st_sel);
-    uint16_t bg = sel ? COL_SEL_BG : COL_BG;
-    uint16_t fg = sel ? COL_SEL_FG : COL_FG;
-    board_lcd_fill_rect(0, y, W, ROW_H, bg);
-    gfx_text(4, y + 1, set_lbl[r], fg, bg);
-    char v[16]; set_value_str(r, v);
-    uint16_t vc = sel ? COL_SEL_FG : ((r > 0 && g_mute[r - 1]) ? COL_ERR : COL_ACCENT);
-    gfx_text(70, y + 1, v, vc, bg);
-  }
+  build_srows();
+  if (st_sel >= g_nsrow) st_sel = g_nsrow - 1;
+  if (st_sel < 0) st_sel = 0;
+  if (st_sel < st_top) st_top = st_sel;
+  if (st_sel >= st_top + VISROWS) st_top = st_sel - VISROWS + 1;
+  for (int r = 0; r < VISROWS; r++) draw_srow(r);
   board_lcd_present();
 }
 static void draw_settings_full(void) {
@@ -439,7 +479,7 @@ static void draw_settings_full(void) {
   board_lcd_fill_rect(0, 0, W, TITLE_H, COL_TITLE_BG);
   gfx_text(2, 4, "Settings", COL_TITLE_FG, COL_TITLE_BG);
   board_lcd_fill_rect(0, H - FOOT_H, W, FOOT_H, COL_TITLE_BG);
-  gfx_text(2, H - FOOT_H + 2, "UD sel  LR change", COL_TITLE_FG, COL_TITLE_BG);
+  gfx_text(2, H - FOOT_H + 2, "UD move  C open/mute", COL_TITLE_FG, COL_TITLE_BG);
   draw_settings_rows();
 }
 
@@ -456,7 +496,33 @@ static void draw_current_rows(void) {
 
 /* ---------- audio control ---------- */
 static void apply_mute(pfm_player *p) {
-  pfm_player_set_mute(p, g_mute[0], g_mute[1], g_mute[2], g_mute[3]);
+  unsigned m = 0;                                 /* OPNA mask: FM 0-5, SSG 6-8, drum 9-14 */
+  for (int c = 0; c < 6; c++) if (g_fm_mute[c])  m |= (1u << c);
+  for (int c = 0; c < 3; c++) if (g_ssg_mute[c]) m |= (1u << (6 + c));
+  if (g_drum_mute) m |= 0x7e00u;                  /* all 6 rhythm voices */
+  pfm_player_set_mask(p, m, g_pcm_mute);
+}
+/* Toggle a leaf setting (output / a channel / drum / PCM) and re-apply. */
+static void settings_toggle_leaf(pfm_player *p, int kind, int ch) {
+  switch (kind) {
+  case K_OUTPUT: g_out_speaker = !g_out_speaker; board_audio_set_output(g_out_speaker); break;
+  case K_FMCH:   g_fm_mute[ch]  = !g_fm_mute[ch];  break;
+  case K_SSGCH:  g_ssg_mute[ch] = !g_ssg_mute[ch]; break;
+  case K_DRUM:   g_drum_mute = !g_drum_mute; break;
+  case K_PCM:    g_pcm_mute  = !g_pcm_mute;  break;
+  default: return;
+  }
+  if (g_song_loaded) apply_mute(p);
+  ui_request(RDR_ROWS);
+}
+/* Center on the selected settings row: fold FM/SSG open|closed, else toggle. */
+static void settings_activate(pfm_player *p) {
+  build_srows();
+  if (st_sel >= g_nsrow) st_sel = g_nsrow - 1;
+  int kind = g_srow[st_sel].kind, ch = g_srow[st_sel].ch;
+  if (kind == K_FM)  { g_fm_open  = !g_fm_open;  ui_request(RDR_FULL); }
+  else if (kind == K_SSG) { g_ssg_open = !g_ssg_open; ui_request(RDR_FULL); }
+  else settings_toggle_leaf(p, kind, ch);
 }
 /* Load file entry `idx` of the current browse dir and make it the playing song.
    Mutes the codec across the swap; the super-loop lifts the mute once the old
@@ -533,12 +599,8 @@ static void page_center(pfm_player *p) {
     else { start_song(p, b_sel); g_page = PG_PLAY; ui_request(RDR_FULL); }
   } else if (g_page == PG_PLAY) {
     toggle_lcd();
-  } else {                              /* settings: toggle selected item */
-    if (st_sel == 0) g_out_speaker = !g_out_speaker;
-    else g_mute[st_sel - 1] = !g_mute[st_sel - 1];
-    board_audio_set_output(g_out_speaker);
-    if (g_song_loaded) apply_mute(p);
-    ui_request(RDR_ROWS);
+  } else {                              /* settings: open/close folder or toggle leaf */
+    settings_activate(p);
   }
 }
 static void page_nav(pfm_player *p, int edge) {
@@ -564,14 +626,17 @@ static void page_nav(pfm_player *p, int edge) {
     } else if (edge & BTN_RIGHT) play_step(p, +1);
     else if (edge & BTN_LEFT) play_step(p, -1);
   } else {                              /* settings */
-    if (edge & BTN_DOWN) { if (st_sel < NSET - 1) st_sel++; ui_request(RDR_ROWS); }
+    build_srows();
+    if (st_sel >= g_nsrow) st_sel = g_nsrow - 1;
+    if (edge & BTN_DOWN) { if (st_sel < g_nsrow - 1) st_sel++; ui_request(RDR_ROWS); }
     else if (edge & BTN_UP) { if (st_sel > 0) st_sel--; ui_request(RDR_ROWS); }
     else if (edge & (BTN_LEFT | BTN_RIGHT)) {
-      if (st_sel == 0) g_out_speaker = !g_out_speaker;
-      else g_mute[st_sel - 1] = !g_mute[st_sel - 1];
-      board_audio_set_output(g_out_speaker);
-      if (g_song_loaded) apply_mute(p);
-      ui_request(RDR_ROWS);
+      int kind = g_srow[st_sel].kind, ch = g_srow[st_sel].ch;
+      if (kind == K_FM || kind == K_SSG) {   /* right opens the folder, left closes it */
+        int *open = (kind == K_FM) ? &g_fm_open : &g_ssg_open;
+        int want = (edge & BTN_RIGHT) ? 1 : 0;
+        if (*open != want) { *open = want; ui_request(RDR_FULL); }
+      } else settings_toggle_leaf(p, kind, ch);
     }
   }
 }

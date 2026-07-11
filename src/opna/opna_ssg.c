@@ -149,13 +149,20 @@ PFM_HOT void opna_ssg_mix(struct opna_ssg *ssg, struct opna_ssg_resampler *r,
      predictable / hoistable. Bit-exact vs the original per-tick loop (108-song
      byte-diff + QEMU). */
   const unsigned simple0 = nd0 && !ce0, simple1 = nd1 && !ce1, simple2 = nd2 && !ce2;
+  /* Fold the per-channel mute mask in here: a muted channel is neither closed-
+     formed nor stepped per tick, so muting frees its CPU. With mask==0 nothing is
+     muted, so smpl==simple / cplx==!simple and this is bit-exact vs unmuted. The
+     shared noise/env still advance every tick regardless. */
+  const unsigned smpl0 = !(mask & 1u) && simple0, cplx0 = !(mask & 1u) && !simple0;
+  const unsigned smpl1 = !(mask & 2u) && simple1, cplx1 = !(mask & 2u) && !simple1;
+  const unsigned smpl2 = !(mask & 4u) && simple2, cplx2 = !(mask & 4u) && !simple2;
   unsigned tob0 = topack & 1u, tob1 = (topack >> 1) & 1u, tob2 = (topack >> 2) & 1u;
   for (unsigned i = 0; i < samples; i++) {
     unsigned ticks = ((idx + 9) >> 1) - (idx >> 1); /* 4 or 5 */
     idx = (idx + 9) & (2 * PFM_SSG_RING - 1);
-    int32_t s0 = simple0 ? ssg_tone_block(&tc0, &tob0, tp0, ticks, tf0, bd0, volc0) : 0;
-    int32_t s1 = simple1 ? ssg_tone_block(&tc1, &tob1, tp1, ticks, tf1, bd1, volc1) : 0;
-    int32_t s2 = simple2 ? ssg_tone_block(&tc2, &tob2, tp2, ticks, tf2, bd2, volc2) : 0;
+    int32_t s0 = smpl0 ? ssg_tone_block(&tc0, &tob0, tp0, ticks, tf0, bd0, volc0) : 0;
+    int32_t s1 = smpl1 ? ssg_tone_block(&tc1, &tob1, tp1, ticks, tf1, bd1, volc1) : 0;
+    int32_t s2 = smpl2 ? ssg_tone_block(&tc2, &tob2, tp2, ticks, tf2, bd2, volc2) : 0;
     for (unsigned k = 0; k < ticks; k++) {
       if (((++nc) >> 1) >= np) {
         nc = 0;
@@ -175,19 +182,19 @@ PFM_HOT void opna_ssg_mix(struct opna_ssg *ssg, struct opna_ssg_resampler *r,
       }
       const unsigned lfsr1 = lfsr & 1;
       const int venv = anyenv ? (int)voltable[eatt ? el : 31 - el] : 0;
-      if (!simple0) {
+      if (cplx0) {
         if (++tc0 >= tp0) { tc0 = 0; tob0 ^= 1u; }
         int v0 = ce0 ? venv : volc0;
         if (!bd0) s0 += ((tf0 || tob0 || td0) && (lfsr1 || nd0)) ? v0 : -v0;
         else s0 += v0 * 2;
       }
-      if (!simple1) {
+      if (cplx1) {
         if (++tc1 >= tp1) { tc1 = 0; tob1 ^= 1u; }
         int v1 = ce1 ? venv : volc1;
         if (!bd1) s1 += ((tf1 || tob1 || td1) && (lfsr1 || nd1)) ? v1 : -v1;
         else s1 += v1 * 2;
       }
-      if (!simple2) {
+      if (cplx2) {
         if (++tc2 >= tp2) { tc2 = 0; tob2 ^= 1u; }
         int v2 = ce2 ? venv : volc2;
         if (!bd2) s2 += ((tf2 || tob2 || td2) && (lfsr1 || nd2)) ? v2 : -v2;

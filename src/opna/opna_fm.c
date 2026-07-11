@@ -469,6 +469,7 @@ PFM_HOT void opna_fm_mix(struct opna_fm *fm, int16_t *buf, unsigned samples) {
   for (unsigned i = 0; i < samples; i++) {
     if (!fm->env_div3) {
       for (int c = 0; c < PFM_FM_CH; c++) {
+        if (fm->mask & (1u << c)) continue;   /* muted channel: fully bypassed */
         for (int s = 0; s < 4; s++) {
           if (fm->channel[c].slot[s].keyon_ext) {
             opna_fm_slot_key(&fm->channel[c], s, true);
@@ -482,10 +483,13 @@ PFM_HOT void opna_fm_mix(struct opna_fm *fm, int16_t *buf, unsigned samples) {
     int32_t ro = buf[i * 2 + 1];
 
     for (int c = 0; c < PFM_FM_CH; c++) {
+      /* Muted channels are skipped BEFORE synthesis so a mute frees its CPU (with
+         mask==0 nothing is skipped, so this is bit-exact vs unmuted). A masked
+         channel's state simply doesn't advance while muted, which is unobserved. */
+      if (fm->mask & (1u << c)) continue;
       if (chan_is_silent(&fm->channel[c])) continue; /* contributes 0, no state change */
       struct fm_frame o = opna_fm_chanout(&fm->channel[c]);
       opna_fm_chan_phase(&fm->channel[c]);
-      if (fm->mask & (1 << c)) continue;
       if (fm->lselect[c]) lo += o.data[1];
       if (fm->rselect[c]) ro += o.data[0];
     }
@@ -495,6 +499,7 @@ PFM_HOT void opna_fm_mix(struct opna_fm *fm, int16_t *buf, unsigned samples) {
 
     if (!fm->env_div3) {
       for (int c = 0; c < PFM_FM_CH; c++) {
+        if (fm->mask & (1u << c)) continue;   /* muted channel: fully bypassed */
         for (int s = 0; s < 4; s++) {
           struct opna_fm_slot *sl = &fm->channel[c].slot[s];
           if (sl->keyon_ext) {

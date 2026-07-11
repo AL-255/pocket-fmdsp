@@ -43,6 +43,8 @@ unsigned pfm_player_loopcount(const pfm_player *p);
 
 /* Mute whole voice groups (nonzero = silence). Reset by init; re-apply per load. */
 void pfm_player_set_mute(pfm_player *p, int fm, int ssg, int drum, int pcm);
+/* Per-channel mute via a raw OPNA mask (FM bits 0-5, SSG 6-8, drum 9-14) + PCM. */
+void pfm_player_set_mask(pfm_player *p, unsigned mask, int pcm);
 
 /* Embedded song title (PMD #Title), Shift-JIS; "" if none. Valid after load. */
 const char *pfm_player_get_title(pfm_player *p);

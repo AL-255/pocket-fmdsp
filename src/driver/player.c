@@ -97,6 +97,13 @@ void pfm_player_set_mute(pfm_player *p, int fm, int ssg, int drum, int pcm) {
   g_pcm_muted = pcm ? true : false;
 }
 
+/* Per-channel mute: `mask` is the raw OPNA mask (FM bits 0-5, SSG 6-8, drum
+   9-14); `pcm` mutes the ppz8 PCM path (outside the OPNA mask). */
+void pfm_player_set_mask(pfm_player *p, unsigned mask, int pcm) {
+  opna_set_mask(&p->opna, mask);
+  g_pcm_muted = pcm ? true : false;
+}
+
 const char *pfm_player_get_title(pfm_player *p) {
   if (p->work.get_comment) {
     const char *t = p->work.get_comment(&p->work, 0); /* line 0 = #Title (PMD) */
