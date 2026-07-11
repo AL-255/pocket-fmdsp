@@ -172,10 +172,12 @@ static char g_cur_title[80];
 static char g_cur_name[48];
 static uint32_t g_unmute_cons;   /* consumed-frame count at which to lift the swap mute */
 static int g_muted_swap;         /* codec muted across a song swap */
+static int g_dbg_len;            /* last load: bytes read (>0) or negative error */
 
-/* --- browser (SD tree, or flash flat when no card) --- */
+/* --- browser (SD only) --- */
 static FATFS g_fatfs;
 static int g_have_sd;
+static int g_mount_rc;           /* f_mount return code (for the debug view) */
 static char g_path[256] = "/";
 #define BR_NAMELEN 48
 static char g_names[VISROWS][BR_NAMELEN];
@@ -283,6 +285,33 @@ static void draw_meter_numbers(unsigned pct, unsigned drpct) {
   x = gfx_text(78, PLAY_CPU_Y, nb, drpct ? COL_ERR : COL_OK, COL_BG);
   gfx_text(x, PLAY_CPU_Y, "%", COL_NUM, COL_BG);
 }
+
+/* ---------- debug panel (live SD / pipeline state) ---------- */
+#define PLAY_DBG_Y (PLAY_LEG_Y + 26)
+static int dbg_app(char *d, int o, const char *lab, int v) {
+  while (*lab) d[o++] = *lab++;
+  if (v < 0) { d[o++] = '-'; v = -v; }
+  char t[12]; int n = 0;
+  do { t[n++] = (char)('0' + v % 10); v /= 10; } while (v);
+  while (n) d[o++] = t[--n];
+  d[o++] = ' '; d[o] = 0;
+  return o;
+}
+static void draw_dbg(void) {
+  char s[48]; int o = 0;
+  o = dbg_app(s, o, "L", g_dbg_len);
+  o = dbg_app(s, o, "fill", board_audio_ring_fill());
+  o = dbg_app(s, o, "E", (int)board_sd_read_errors());
+  board_lcd_fill_rect(2, PLAY_DBG_Y, W - 4, GFX_CH, COL_BG);
+  gfx_text(2, PLAY_DBG_Y, s, COL_NUM, COL_BG);
+  o = 0;
+  o = dbg_app(s, o, "sd", g_have_sd);
+  o = dbg_app(s, o, "rc", g_mount_rc);
+  o = dbg_app(s, o, "ld", g_song_loaded);
+  o = dbg_app(s, o, "m", g_muted_swap);
+  board_lcd_fill_rect(2, PLAY_DBG_Y + 11, W - 4, GFX_CH, COL_BG);
+  gfx_text(2, PLAY_DBG_Y + 11, s, COL_NUM, COL_BG);
+}
 static void draw_play_chrome(void) {
   board_lcd_clear(COL_BG);
   gfx_text(2, PLAY_TITLE_Y, g_cur_title[0] ? g_cur_title : "(no title)", COL_TITLE_FG, COL_BG);
@@ -296,6 +325,7 @@ static void draw_play_chrome(void) {
     gfx_text(x + 9, y, task_lbl[t], COL_FG, COL_BG);
   }
   draw_vol(g_volume);
+  draw_dbg();
   gfx_text(2, H - 10, "holdC pages UDvol LRsong", COL_NUM, COL_BG);
   board_lcd_present();
 }
@@ -328,10 +358,19 @@ static void draw_browser_rows(void) {
 static void draw_browser_full(void) {
   board_lcd_clear(COL_BG);
   board_lcd_fill_rect(0, 0, W, TITLE_H, COL_TITLE_BG);
-  gfx_text(2, 4, g_have_sd ? g_path : UI_TITLE, COL_TITLE_FG, COL_TITLE_BG);
+  gfx_text(2, 4, g_have_sd ? g_path : "no SD card", COL_TITLE_FG, COL_TITLE_BG);
+  if (!g_have_sd) {
+    char m[24];
+    strcpy(m, "insert SD (mount ");
+    u2a(m + strlen(m), (unsigned)(g_mount_rc < 0 ? -g_mount_rc : g_mount_rc), 1);
+    int e = (int)strlen(m); m[e] = ')'; m[e + 1] = 0;
+    gfx_text(2, LIST_Y + 4, m, COL_ERR, COL_BG);
+    gfx_text(2, LIST_Y + 16, "hold C = other pages", COL_NUM, COL_BG);
+  }
   board_lcd_fill_rect(0, H - FOOT_H, W, FOOT_H, COL_TITLE_BG);
   gfx_text(2, H - FOOT_H + 2, "UD sel  LR dir  C play", COL_TITLE_FG, COL_TITLE_BG);
-  draw_browser_rows();
+  if (g_have_sd) draw_browser_rows();
+  else board_lcd_present();
 }
 static void browse_reload(void) { b_count = src_count(); b_sel = 0; b_top = 0; }
 
@@ -379,20 +418,28 @@ static int start_song(pfm_player *p, int idx) {
      SD read plays out muted rather than glitching. */
   if (g_song_loaded) { board_audio_mute(1); g_muted_swap = 1; }
   int len = src_load_idx(idx);                 /* SD read: 10x per-block retry + CRC */
+  g_dbg_len = len;
   if (len <= 0) goto fail;                      /* card read failed */
   pfm_player_init(p);
-  if (!pfm_player_load(p, g_songbuf, (size_t)len)) goto fail; /* not a valid PMD */
+  if (!pfm_player_load(p, g_songbuf, (size_t)len)) { g_dbg_len = -99; goto fail; } /* not PMD */
   apply_mute(p);
   const char *t = pfm_player_get_title(p);
   strncpy(g_cur_title, (t && t[0]) ? t : name, sizeof(g_cur_title) - 1);
   g_cur_title[sizeof(g_cur_title) - 1] = 0;
   strcpy(g_play_path, g_path);
   g_play_idx = idx;
-  if (!g_song_loaded) {                          /* first song: bring the codec up */
+  /* Reset the ENTIRE audio pipeline on every song so nothing carries over between
+     tracks: first song opens the codec; a switch re-primes the ring/DMA/counters
+     (clears the drift the blocking SD read introduces). */
+  if (!g_song_loaded) {
     board_audio_open(PFM_MIX_RATE, 0);
     board_audio_set_volume(g_volume);
-    board_audio_mute(1); g_muted_swap = 1;       /* mute the codec power-up transient */
+    board_audio_set_output(g_out_speaker);
+    board_audio_mute(1);
+  } else {
+    board_audio_restart();
   }
+  g_muted_swap = 1;
   g_render_frames = 0;
   g_unmute_cons = board_audio_consumed_frames() + 1024; /* unmute once old tail drains */
   g_song_loaded = 1;
@@ -508,6 +555,7 @@ void ui_lcd_task(void) {
     if (g_page == PG_PLAY && g_song_loaded && g_lcd_on) {
       draw_cpu_bar(snap, budget);
       draw_meter_numbers(pct, drpct);
+      draw_dbg();
       board_lcd_present();
     }
     LCD_UNLOCK();
@@ -516,7 +564,8 @@ void ui_lcd_task(void) {
 
 void ui_run(void) {
   pfm_player *p = pfm_player_instance();
-  g_have_sd = (f_mount(&g_fatfs, "", 1) == FR_OK);
+  g_mount_rc = f_mount(&g_fatfs, "", 1);
+  g_have_sd = (g_mount_rc == FR_OK);
   strcpy(g_path, "/");
   board_audio_set_output(g_out_speaker);
   browse_reload();
@@ -524,7 +573,7 @@ void ui_run(void) {
   LCD_LOCK(); draw_browser_full(); LCD_UNLOCK();
 
   int prevb = board_input_poll();
-  TickType_t c_press = 0, last_nav = 0;
+  TickType_t c_press = 0, last_nav = 0, last_yield = 0;
   int c_armed = !(prevb & BTN_CENTER), c_done = 0;
   for (;;) {
     int rendered = 0;
@@ -555,7 +604,13 @@ void ui_run(void) {
       last_nav = now;
     }
     prevb = b;
-    if (!rendered) vTaskDelay(1);
+    /* Yield when idle, and force a slot at least every ~33 ms even when rendering
+       flat-out, so the lowest-priority meter task can't be starved (a 1-tick nap
+       drains ~55 frames; the ring has far more, so audio is unaffected). */
+    if (!rendered || (now - last_yield) >= pdMS_TO_TICKS(33)) {
+      vTaskDelay(1);
+      last_yield = now;
+    }
   }
 }
 

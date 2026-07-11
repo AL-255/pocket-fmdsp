@@ -160,20 +160,32 @@ static int read_one_block(uint32_t arg, uint8_t *buf) {
   return 0;
 }
 
+static uint32_t g_read_errs; /* blocks that never read clean within the retry budget */
+uint32_t board_sd_read_errors(void) { return g_read_errs; }
+
 /* Read `count` 512-byte blocks starting at LBA `lba` into buf. Each block is
-   retried up to 10 times on any command/token/CRC failure before giving up. */
+   retried up to 10 times on any command/token/CRC failure. If a block still
+   fails CRC after 10 tries we KEEP the last read (a CRC miss still delivered
+   512 bytes) rather than hard-failing, so a marginal card degrades gracefully
+   instead of breaking the mount; the failure is counted for the debug view. A
+   block that never even reaches the data phase (bad command/token) is a hard
+   error. */
 #define SD_READ_RETRIES 10
 int sd_read_blocks(uint32_t lba, uint8_t *buf, unsigned count) {
   if (!sd_type) return -1;
   uint32_t base = (sd_type == 2) ? lba : lba * 512u;
   for (unsigned blk = 0; blk < count; blk++) {
     uint32_t arg = base + (sd_type == 2 ? blk : blk * 512u);
-    int rc = -1;
+    int rc = -1, got_data = 0;
     for (int attempt = 0; attempt < SD_READ_RETRIES; attempt++) {
       rc = read_one_block(arg, buf);
       if (rc == 0) break;
+      if (rc == -4) got_data = 1;   /* buf holds a CRC-bad (but complete) block */
     }
-    if (rc != 0) return rc;   /* still failing after 10 tries */
+    if (rc != 0) {
+      g_read_errs++;
+      if (!got_data) return rc;      /* never reached data phase -> hard fail */
+    }
     buf += 512;
   }
   return 0;

@@ -12,7 +12,6 @@
  */
 #include "board.h"
 #include "primer2_pins.h"
-#include "songs.h"
 #include "pfm/pfm_config.h"
 #include "pfm/pfm_prof.h"
 #include <stdint.h>
@@ -331,14 +330,21 @@ static void i2c_codec_write_reg(uint8_t reg, uint8_t val) {
   I2C2_CR1 |= (1u << 9);
 }
 
-/* Volume 0..BOARD_VOL_MAX -> STW5094A headphone gain (CR8/CR9). */
+/* Digital volume gain (Q15), applied to samples in board_audio_write so it works
+   for headphone AND loudspeaker. Roughly perceptual (each step ~ a few dB). */
+static int32_t g_vol_q15 = 8192;
+static const int32_t vol_q15_tab[BOARD_VOL_MAX + 1] = {
+  0, 512, 1024, 2048, 4096, 8192, 12288, 17408, 23552, 28672, 32767,
+};
+
+/* Volume 0..BOARD_VOL_MAX -> digital gain (both outputs). */
 void board_audio_set_volume(int level) {
   if (level < 0) level = 0;
   if (level > BOARD_VOL_MAX) level = BOARD_VOL_MAX;
-  /* CR8/CR9 are attenuation (higher = quieter), so invert: level 10 -> 0 (loud). */
-  uint8_t g = (uint8_t)((BOARD_VOL_MAX - level) * 3);
-  i2c_codec_write_reg(8, g);
-  i2c_codec_write_reg(9, g);
+  /* Digital gain applied in board_audio_write, so it works for BOTH the headphone
+     and the loudspeaker path (the codec HP-gain regs only affect headphones). The
+     codec analog gains stay at their loud default; this scales the samples. */
+  g_vol_q15 = vol_q15_tab[level];
 }
 
 /* CR6 routing: bit5 = MUT, 0x10 = loudspeaker, 0x0c = headphone, 0x02 = SE.
@@ -373,9 +379,9 @@ static void codec_init(void) {
   cr[4] = 0x6f;
   cr[5] = 0x17;
   cr[6] = g_cr6;              /* headphone (PHL/PHR) + SE, loudspeaker off, not muted */
-  cr[7] = 0x04;               /* output gain */
-  cr[8] = 0x14;               /* HP gain L */
-  cr[9] = 0x14;               /* HP gain R */
+  cr[7] = 0x04;               /* loudspeaker output gain (fixed; volume is digital) */
+  cr[8] = 0x00;               /* HP gain L: loudest (digital volume scales samples) */
+  cr[9] = 0x00;               /* HP gain R: loudest */
   cr[12] = 0x84;
   cr[13] = 89;
   cr[14] = 89;
@@ -469,7 +475,9 @@ PFM_HOT void board_audio_write(const int16_t *src, size_t frames) {
     if (run > freesmp) run = freesmp;
     unsigned rem = (unsigned)(total - done);
     if (run > rem) run = rem;
-    for (unsigned k = 0; k < run; k++) g_ring[wr + k] = src[done + k];
+    int32_t vol = g_vol_q15;
+    for (unsigned k = 0; k < run; k++)
+      g_ring[wr + k] = (int16_t)(((int32_t)src[done + k] * vol) >> 15);
     wr += run;
     if (wr >= size) wr -= size;
     g_wr = wr;
@@ -492,21 +500,32 @@ void board_audio_close(void) {
   i2c_codec_write(mute, 22);
 }
 
-/* ---------------- storage: songs in flash ---------------- */
-int board_storage_count(void) { return SONG_COUNT; }
-const char *board_storage_name(int i) {
-  return (i >= 0 && i < SONG_COUNT) ? song_table[i].name : "";
+/* Re-prime the ring + DMA to a clean pre-filled state WITHOUT touching the codec.
+   Called on song switch: the blocking SD read stalls the producer past one ring
+   period, so the DMA read pointer wraps more than once and the consumed counter
+   under-counts permanently (ring_fill drifts high -> renderer stops). Resetting
+   the counters + DMA here clears that drift so every switch starts fresh. */
+void board_audio_restart(void) {
+  SPI3_I2SCFGR &= ~(1u << 10);            /* I2SE off */
+  DMA2_CCR2 &= ~1u;                        /* DMA disable */
+  for (unsigned i = 0; i < AUD_RING * 2; i++) g_ring[i] = 0;
+  g_wr = 0;
+  g_written_s = AUD_RING * 2;              /* pre-filled with silence */
+  g_consumed_s = 0;
+  g_dropped_s = 0;
+  g_last_rd = 0;
+  DMA2_CNDTR2 = AUD_RING * 2;
+  DMA2_CMAR2 = (uint32_t)g_ring;
+  DMA2_CCR2 |= 1u;                         /* DMA enable */
+  SPI3_I2SCFGR |= (1u << 10);             /* I2SE on */
 }
-const char *board_storage_group(int i) {
-  return (i >= 0 && i < SONG_COUNT) ? song_table[i].group : "";
-}
+
+/* ---------------- storage: SD only (no flash-embedded songs) ---------------- */
+int board_storage_count(void) { return 0; }
+const char *board_storage_name(int i) { (void)i; return ""; }
+const char *board_storage_group(int i) { (void)i; return ""; }
 int board_storage_load(int i, uint8_t *buf, size_t maxlen) {
-  if (i < 0 || i >= SONG_COUNT) return -1;
-  uint32_t len = song_table[i].len;
-  if (len > maxlen) return -1;
-  const uint8_t *src = &song_blob[song_table[i].off];
-  for (uint32_t k = 0; k < len; k++) buf[k] = src[k]; /* must be RAM: driver writes loop counters */
-  return (int)len;
+  (void)i; (void)buf; (void)maxlen; return -1;
 }
 
 /* ---------------- lifecycle ---------------- */
