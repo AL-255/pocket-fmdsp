@@ -1,11 +1,15 @@
 # pocket-fmdsp
 
-A small, fast, **integer-only** player for PC-98 **PMD** (`.M`) music, targeting an
-**STM32F103V** (ARM Cortex-M3, no FPU/SIMD/DSP, 512 kB Flash / 64 kB RAM),
-streaming songs from an SD card.
+pocket-fmdsp is a from-scratch, **integer-only** player for PC-98 **PMD** (`.M`)
+chiptune, running on an **STM32 Primer2** (ARM Cortex-M3 @ 132 MHz, 512 kB flash /
+64 kB RAM — no FPU, SIMD, or DSP). It reimplements and hand-optimizes the **OPNA
+(YM2608)** FM + SSG + rhythm synthesis for that core, streaming songs from a microSD
+card through a bit-bang SD driver, FreeRTOS, FatFs, and an I²S codec. On-device it
+has a hierarchical file browser, a tabbed Browser/Playback/Settings UI, per-voice
+muting, digital volume, and a live per-task CPU meter. FM/SSG are bit-exact and
+assembly-optimized; drums play PCM samples embedded in flash. The PMD sequencer is
+ported from the reference for bit-exact `.M` parsing.
 
-The OPNA (YM2608) sound chip is **reimplemented and optimized** for the M3; the PMD
-sequence driver is **ported** from the reference for bit-exact `.M` parsing.
 Correctness reference: <https://github.com/myon98/98fmplayer>.
 See [DESIGN.md](DESIGN.md) for the full architecture, memory budget, and survey.
 
@@ -15,15 +19,16 @@ See [DESIGN.md](DESIGN.md) for the full architecture, memory budget, and survey.
 |-----------|-------|
 | OPNA FM (6ch × 4op, 8 algorithms, ADSR, feedback, CH3 mode) | ✅ done, **bit-exact** |
 | OPNA SSG (3 tone + noise + envelope, box resampler) | ✅ done, **bit-exact** |
-| OPNA rhythm/drum (on-the-fly 8 kB ROM decode) | ✅ done (needs a ROM to sound) |
+| OPNA rhythm/drum (flash-embedded PCM samples) | ✅ done, audible on device |
 | OPNA ADPCM-B | ⛔ stubbed (256 kB sample RAM — later) |
 | Timer A/B + render loop | ✅ done, bit-exact |
 | PMD `.M` loader (header, pointer table, instruments) | ✅ done, verified |
 | PMD sequencer (tick engine, ~120 opcodes) | ✅ done (vendored, drives our OPNA) |
 | Full song playback → WAV | ✅ **plays all 108 test songs** |
 | Cortex-M3 cross-compile | ✅ ~34 kB flash (`scripts/check-m3.sh`) |
-| **STM32 Primer2 firmware + QEMU env** (LCD track list, joystick, Shift-JIS) | ✅ runs in QEMU — see [`firmware/`](firmware/README.md) |
-| Real Primer2 peripheral drivers (FSMC LCD, SDIO, I2S codec) | 🚧 skeleton in `firmware/bsp/primer2` |
+| **STM32 Primer2 firmware** (SD browser, tab UI, joystick, Shift-JIS) | ✅ runs on hardware + QEMU — see [`firmware/`](firmware/README.md) |
+| Real Primer2 peripheral drivers (FSMC LCD, bit-bang SD-SPI, STW5094A I²S codec) | ✅ done, on hardware |
+| FreeRTOS (codec > SD > OPNA render > LCD priority) + assembly SSG/SD-SPI | ✅ done |
 
 ## What works now
 
@@ -70,7 +75,37 @@ cmake --build build -j
 ```
 
 Output is interleaved-stereo signed-16-bit WAV at 55466 Hz (the OPNA native rate).
-Pass an 8 kB YM2608 rhythm ROM as the 5th `render` arg to make drums audible.
+Drums play the flash-embedded PCM samples automatically — no ROM needed.
+
+## Build the firmware (STM32 Primer2)
+
+Needs the `gcc-arm-none-eabi` toolchain on `PATH`.
+
+```sh
+# configure once with the bare-metal ARM toolchain file
+cmake -S firmware -B build-fw \
+  -DCMAKE_TOOLCHAIN_FILE=$PWD/firmware/cmake/arm-none-eabi.cmake
+cmake --build build-fw -j
+
+# targets:
+#   build-fw/pocketfm_hw.elf   real Primer2 firmware (SD browser + player)
+#   build-fw/pocketfm_sim.elf  QEMU/semihosting build (same player, host I/O)
+```
+
+Run the sim build under QEMU (no hardware needed) — see
+[`firmware/README.md`](firmware/README.md):
+
+```sh
+./firmware/tools/run_qemu_sim.sh "DDD C R C"   # scripted joystick input
+```
+
+Flashing `pocketfm_hw.elf`/`.hex` to real hardware uses an ST-LINK/RLink SWD probe;
+see [FLASHING.md](FLASHING.md). Prebuilt ELFs are attached to each
+[GitHub release](../../releases).
+
+Every optimization to the OPNA is validated **bit-exact** against the host C
+reference by re-rendering on the QEMU ARM sim and diffing PCM
+(`scripts/validate-arm-audio.sh <song.M>`).
 
 ## Layout
 
@@ -93,9 +128,7 @@ interface. This gives correct playback with the speed/size wins where they matte
 
 ## Next
 
-1. Cortex-M3 firmware: FatFs/SDIO to stream `.M` from SD, I2S/DAC DMA double-buffer
-   at the audio rate, run under QEMU/Renode. Stub `ppz8` (unused by these songs) to
-   reclaim ~5.8 kB flash + ~7 kB RAM.
-2. Output resampling 55466 → 44100/48000 Hz for real codecs (cheap linear/poly).
-3. Optional: ADPCM-B streamed from SD (small window instead of 256 kB RAM); drum ROM
-   on SD.
+1. Further OPNA speedups: the FM operator core is the remaining hot path (~70% of
+   render); explore bit-exact wins beyond the envelope OFF-slot skip already landed.
+2. ADPCM-B (`ppz8`) streamed from SD in a small window instead of 256 kB RAM.
+3. Output resampling 55466 → 44100/48000 Hz for other codecs (cheap linear/poly).
