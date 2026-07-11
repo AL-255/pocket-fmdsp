@@ -499,8 +499,12 @@ PFM_HOT void opna_fm_mix(struct opna_fm *fm, int16_t *buf, unsigned samples) {
           struct opna_fm_slot *sl = &fm->channel[c].slot[s];
           if (sl->keyon_ext) {
             sl->keyon_ext = false;
-          } else {
-            /* inline the boundary test; only the rare actual step is a call */
+          } else if (sl->env_state != PFM_ENV_OFF) {
+            /* OFF slots need no stepping: env_step is a no-op for OFF (atten_base
+               already pinned at max) and env_count is reset on the next key-on, so
+               skipping it is bit-exact and drops all decayed/unused slots from the
+               per-sample envelope pass. inline the boundary test; only the rare
+               actual step is a call. */
             int rs = sl->rate_shifter;
             if ((sl->env_count & ((1 << rs) - 1)) == ((1 << rs) - 1))
               opna_fm_slot_env_step(sl);
