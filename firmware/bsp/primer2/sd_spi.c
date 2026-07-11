@@ -213,3 +213,37 @@ SD_HOT int sd_read_blocks(uint32_t lba, uint8_t *buf, unsigned count) {
   }
   return 0;
 }
+
+/* Write one 512-byte block (CMD24). SPI single-block write: send the command,
+   a start token 0xFE, 512 data bytes, dummy CRC, read the data-response token
+   (accepted == xxx0_0101), then poll while the card holds MISO low (busy). */
+SD_HOT static int write_one_block(uint32_t arg, const uint8_t *buf) {
+  CS_LO();
+  uint8_t r = send_cmd(24, arg, 0xFF);
+  if (r != 0x00) { CS_HI(); xchg(0xFF); return -2; }
+  xchg(0xFF);                          /* one-byte gap before the data token */
+  xchg(0xFE);                          /* data start token */
+  for (unsigned i = 0; i < 512; i++) xchg(buf[i]);
+  xchg(0xFF); xchg(0xFF);              /* dummy CRC (ignored in SPI mode) */
+  uint8_t resp = xchg(0xFF);
+  if ((resp & 0x1F) != 0x05) { CS_HI(); xchg(0xFF); return -3; } /* not accepted */
+  int tries = 1000000;
+  while (xchg(0xFF) == 0x00 && --tries) { }   /* wait out the programming busy */
+  CS_HI();
+  xchg(0xFF);
+  return tries ? 0 : -4;
+}
+
+/* Write `count` 512-byte blocks starting at LBA `lba`, retrying up to 10x each. */
+SD_HOT int sd_write_blocks(uint32_t lba, const uint8_t *buf, unsigned count) {
+  if (!sd_type) return -1;
+  uint32_t base = (sd_type == 2) ? lba : lba * 512u;
+  for (unsigned blk = 0; blk < count; blk++) {
+    uint32_t arg = base + (sd_type == 2 ? blk : blk * 512u);
+    int rc = -1;
+    for (int a = 0; a < 10; a++) { rc = write_one_block(arg, buf); if (rc == 0) break; }
+    if (rc != 0) return rc;
+    buf += 512;
+  }
+  return 0;
+}

@@ -234,6 +234,17 @@ static void backlight_init(void) {
   TIM4_CR1 = 1;              /* enable counter (CEN) */
 }
 
+/* Backlight brightness 0..BOARD_BL_MAX -> TIM4_CH3 PWM duty. Roughly perceptual
+   (exponential-ish) so the low steps aren't all indistinguishably bright. */
+void board_lcd_backlight(int level) {
+  static const uint16_t duty[BOARD_BL_MAX + 1] = {
+    0x0400, 0x0C00, 0x1800, 0x3000, 0x5800, 0x8800, 0xC000, 0xFFFF
+  };
+  if (level < 0) level = 0;
+  if (level > BOARD_BL_MAX) level = BOARD_BL_MAX;
+  TIM4_CCR3 = duty[level];
+}
+
 /* ---------------- joystick ---------------- */
 /* Pressed shorts the line to the pulled-up common => reads HIGH. Inputs use
    internal pull-downs so an open contact reads LOW. */

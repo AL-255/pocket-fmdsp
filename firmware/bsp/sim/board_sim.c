@@ -42,6 +42,7 @@ static void num3(char *d, int n) { /* NNN into d[0..2] */
   d[2] = '0' + n % 10;
 }
 
+void board_lcd_backlight(int level) { (void)level; } /* sim: no panel */
 void board_lcd_present(void) {
   char path[] = "sim_shot_000.ppm";
   num3(path + 9, g_shot_no++);

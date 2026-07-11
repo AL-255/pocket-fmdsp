@@ -3,7 +3,7 @@
 #define FFCONF_DEF	80386
 
 /* Function config */
-#define FF_FS_READONLY   1   /* read-only: we only browse and load songs */
+#define FF_FS_READONLY   0   /* browse + load songs; also write /fmdsp.cfg */
 #define FF_FS_MINIMIZE   1   /* keep opendir/readdir/open/read/lseek; drop write/manage */
 #define FF_USE_FIND      0
 #define FF_USE_MKFS      0

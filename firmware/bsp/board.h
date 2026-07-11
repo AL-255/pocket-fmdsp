@@ -32,6 +32,8 @@ void board_lcd_clear(uint16_t color);
 void board_lcd_fill_rect(int x, int y, int w, int h, uint16_t color);
 void board_lcd_pixel(int x, int y, uint16_t color);
 void board_lcd_present(void); /* sim: emit a screenshot; real: no-op (GRAM live) */
+#define BOARD_BL_MAX 7
+void board_lcd_backlight(int level); /* 0..BOARD_BL_MAX backlight brightness (PWM duty) */
 
 /* ---- input ---- */
 /* Block until the next joystick event; returns a BTN_* value.
