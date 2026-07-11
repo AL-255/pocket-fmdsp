@@ -43,6 +43,7 @@ static int g_lcd_on = 1;             /* tap C toggles LCD drawing during playbac
 #include "FreeRTOS.h"
 #include "task.h"
 #include "semphr.h"
+#define DWT_CYCCNT (*(volatile uint32_t *)0xE0001004u)  /* Cortex-M DWT cycle counter */
 static SemaphoreHandle_t g_lcd_mtx;
 static StaticSemaphore_t g_lcd_mtx_buf;
 static volatile int g_song_loaded;      /* 1 while a song is loaded and rendering */
@@ -106,15 +107,16 @@ static void draw_list(int sel, int top, int n) {  /* sim browser only */
 #define RGB_C(r, g, b) \
   ((uint16_t)((((r) & 0xf8) << 8) | (((g) & 0xfc) << 3) | ((b) >> 3)))
 static const uint16_t task_col[PFM_PROF_N] = {
-  RGB_C(255, 70, 70),   /* FM       */
-  RGB_C(90, 220, 90),   /* SSG      */
-  RGB_C(80, 130, 255),  /* DRUM     */
-  RGB_C(240, 210, 60),  /* PCM      */
-  RGB_C(230, 90, 220),  /* SEQ      */
-  RGB_C(60, 220, 220),  /* RESAMPLE */
+  RGB_C(255, 70, 70),   /* FM     */
+  RGB_C(90, 220, 90),   /* SSG    */
+  RGB_C(80, 130, 255),  /* DRUM   */
+  RGB_C(240, 210, 60),  /* PCM    */
+  RGB_C(230, 90, 220),  /* SEQ    */
+  RGB_C(60, 220, 220),  /* OUTPUT */
+  RGB_C(255, 160, 60),  /* SD     */
 };
 static const char *const task_lbl[PFM_PROF_N] = {
-  "FM", "SSG", "DRM", "PCM", "SEQ", "OUT",
+  "FM", "SSG", "DRM", "PCM", "SEQ", "OUT", "SD",
 };
 
 /* Full bar width = 100% of the real-time CPU budget. Draw each task's share as
@@ -191,7 +193,7 @@ static int  g_play_idx;
 static const char *const set_lbl[NSET] = { "Output", "FM", "SSG", "Drum", "PCM" };
 static int st_sel;
 static uint8_t g_out_speaker;    /* 0 headphone, 1 loudspeaker */
-static uint8_t g_mute[4];        /* FM, SSG, DRUM, PCM */
+static uint8_t g_mute[4] = { 0, 0, 0, 1 }; /* FM, SSG, DRUM, PCM — PCM muted by default */
 
 /* ---------- SD directory helpers ---------- */
 static int sd_dir_count(void) {
@@ -273,7 +275,9 @@ void ui_set_task_handles(void *sd, void *app) {
 void ui_sd_task(void) {
   for (;;) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);   /* wait for a load request */
+    uint32_t t0 = DWT_CYCCNT;
     g_sd_result = src_load_idx(g_sd_req_idx);  /* the actual SD read */
+    pfm_prof_cyc[PFM_PROF_SD] += DWT_CYCCNT - t0; /* show read time in the CPU bar */
     if (g_app_task) xTaskNotifyGive(g_app_task);
   }
 }
@@ -311,7 +315,7 @@ static void draw_meter_numbers(unsigned pct, unsigned drpct) {
 }
 
 /* ---------- debug panel (live SD / pipeline state) ---------- */
-#define PLAY_DBG_Y (PLAY_LEG_Y + 26)
+#define PLAY_DBG_Y (PLAY_LEG_Y + 38)   /* below the 3-row (7-entry) legend */
 static int dbg_app(char *d, int o, const char *lab, int v) {
   while (*lab) d[o++] = *lab++;
   if (v < 0) { d[o++] = '-'; v = -v; }

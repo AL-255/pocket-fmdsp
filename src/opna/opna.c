@@ -30,12 +30,21 @@ uint32_t (*pfm_prof_clock)(void);
 PFM_HOT void opna_mix(struct opna *opna, int16_t *buf, unsigned samples) {
   uint32_t t;
   memset(buf, 0, (size_t)samples * 2 * sizeof(int16_t));
-  t = pfm_prof_begin(); opna_fm_mix(&opna->fm, buf, samples);
-  pfm_prof_end(PFM_PROF_FM, t);
-  t = pfm_prof_begin(); opna_ssg_mix(&opna->ssg, &opna->resampler, buf, samples);
-  pfm_prof_end(PFM_PROF_SSG, t);
-  t = pfm_prof_begin(); opna_drum_mix(&opna->drum, buf, samples);
-  pfm_prof_end(PFM_PROF_DRUM, t);
+  /* Fully-masked groups are bypassed entirely (no synthesis) so muting a voice in
+     Settings frees its CPU. SSG especially: its tick loop ran regardless of mask
+     before. Masks are all-or-nothing here (only the mute UI sets them). */
+  if ((opna->fm.mask & 0x3f) != 0x3f) {
+    t = pfm_prof_begin(); opna_fm_mix(&opna->fm, buf, samples);
+    pfm_prof_end(PFM_PROF_FM, t);
+  }
+  if (opna->ssg.mask != 0x7) {
+    t = pfm_prof_begin(); opna_ssg_mix(&opna->ssg, &opna->resampler, buf, samples);
+    pfm_prof_end(PFM_PROF_SSG, t);
+  }
+  if (opna->drum.mask != 0x3f) {
+    t = pfm_prof_begin(); opna_drum_mix(&opna->drum, buf, samples);
+    pfm_prof_end(PFM_PROF_DRUM, t);
+  }
   opna->generated_frames += samples;
 }
 

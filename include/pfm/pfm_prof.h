@@ -20,6 +20,7 @@ enum {
   PFM_PROF_PCM,       /* ppz8 PCM mix  */
   PFM_PROF_SEQ,       /* PMD sequencer (timer interrupt) */
   PFM_PROF_OUTPUT,    /* board copy into the DMA ring    */
+  PFM_PROF_SD,        /* SD card file read (sd task)     */
   PFM_PROF_N
 };
 
