@@ -286,7 +286,7 @@ int board_input_wait(void) {
    Output is routed to the headphone jack only (CR6 bits 0x0c = PHL/PHR); the
    loudspeaker (bit 0x10) is off, as this board has no HP-detect line. */
 
-#define AUD_RING 2048                    /* stereo frames in the DMA FIFO (~37 ms) */
+#define AUD_RING 1024                    /* stereo frames in the DMA FIFO (~18 ms) */
 static int16_t g_ring[AUD_RING * 2];     /* interleaved L,R @ I2S_FS */
 static unsigned g_wr;                    /* write cursor (in samples) */
 

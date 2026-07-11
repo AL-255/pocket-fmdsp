@@ -85,3 +85,11 @@ PFM_HOT void pfm_player_render(pfm_player *p, int16_t *buf, size_t frames) {
 }
 
 unsigned pfm_player_loopcount(const pfm_player *p) { return p->work.loop_cnt; }
+
+const char *pfm_player_get_title(pfm_player *p) {
+  if (p->work.get_comment) {
+    const char *t = p->work.get_comment(&p->work, 0); /* line 0 = #Title (PMD) */
+    if (t && t[0]) return t;
+  }
+  return "";
+}

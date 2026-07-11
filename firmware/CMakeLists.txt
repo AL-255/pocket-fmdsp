@@ -79,19 +79,25 @@ set(FREERTOS_SRC
   freertos/tasks.c freertos/list.c freertos/queue.c freertos/portable/port.c)
 set_source_files_properties(${FREERTOS_SRC} PROPERTIES COMPILE_OPTIONS "-w;-O2")
 
+# FatFs + SD-SPI (hardware target only)
+set(FATFS_SRC fatfs/ff.c fatfs/ffunicode.c fatfs/diskio.c)
+set_source_files_properties(${FATFS_SRC} PROPERTIES COMPILE_OPTIONS "-w;-Os")
+
 # Stage 2: the player firmware (FSMC/ST7732 LCD + joystick + songs in flash)
 add_hw_target(pocketfm_hw
   startup/startup.c
   bsp/primer2/board_primer2.c
+  bsp/primer2/sd_spi.c
   gui/gfx.c
   gui/ui.c
   app/main_hw.c
   ${CORE_SRC}
   ${VENDOR_SRC}
   ${FREERTOS_SRC}
+  ${FATFS_SRC}
 )
 target_include_directories(pocketfm_hw PRIVATE gen
-  freertos freertos/include freertos/portable)
+  freertos freertos/include freertos/portable fatfs)
 # place the per-sample render functions in 0-wait SRAM (.ramfunc)
 target_compile_definitions(pocketfm_hw PRIVATE PFM_RAMFUNC=1 PFM_RTOS=1)
 # emulate YM2203 (OPN, PC-9801-26K): 3 FM channels instead of the OPNA's 6

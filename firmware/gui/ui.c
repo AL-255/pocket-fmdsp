@@ -46,9 +46,8 @@ static int g_lcd_on = 1;             /* tap C toggles LCD drawing during playbac
 static SemaphoreHandle_t g_lcd_mtx;
 static StaticSemaphore_t g_lcd_mtx_buf;
 static volatile int g_playing;          /* 1 while a song is rendering */
-static volatile int g_cur_sel;          /* song index being played */
 static volatile uint32_t g_render_frames; /* cumulative frames produced */
-#define AUD_HIGH_WATER 1536 /* frames: yield to LCD when the ring is this full */
+#define AUD_HIGH_WATER 768 /* frames: yield to LCD when the ring is this full */
 #define LCD_LOCK()   xSemaphoreTake(g_lcd_mtx, portMAX_DELAY)
 #define LCD_UNLOCK() xSemaphoreGive(g_lcd_mtx)
 void ui_init(void) { g_lcd_mtx = xSemaphoreCreateMutexStatic(&g_lcd_mtx_buf); }
@@ -113,7 +112,7 @@ static const uint16_t task_col[PFM_PROF_N] = {
   RGB_C(60, 220, 220),  /* RESAMPLE */
 };
 static const char *const task_lbl[PFM_PROF_N] = {
-  "FM", "SSG", "DRUM", "PCM", "SEQ", "OUTPUT",
+  "FM", "SSG", "DRM", "PCM", "SEQ", "OUT",
 };
 
 /* Full bar width = 100% of the real-time CPU budget. Draw each task's share as
@@ -144,63 +143,43 @@ static void draw_vol(int vol) {
   board_lcd_fill_rect(40, y + 1, fw, 5, COL_BAR);
 }
 
-#define PLAY_LEGEND_Y (BAR_H + 60)
+#include <string.h>
 
-/* (Re)draw the static playback screen chrome (title, legend, volume, hint). */
-static void draw_play_chrome(int sel) {
+static char g_cur_title[80]; /* Shift-JIS title/name shown on the play screen */
+
+/* Static playback chrome: title + compact 2x3 legend + CPU/DR labels. */
+static void draw_play_chrome(void) {
   board_lcd_clear(COL_BG);
-  gfx_text(2, BAR_H + 4, UI_NOWPLAYING, COL_TITLE_FG, COL_BG);
-  const char *grp = board_storage_group(sel);
-  if (grp && grp[0]) gfx_text(2, BAR_H + 16, grp, COL_SUB_FG, COL_BG);
-  gfx_text(2, BAR_H + 28, board_storage_name(sel), COL_FG, COL_BG);
-  { /* static labels; only the two numbers are redrawn each meter tick */
-    int cy = BAR_H + 44;
-    gfx_text(2, cy, "CPU", COL_NUM, COL_BG);
-    gfx_text(30, cy, "%", COL_NUM, COL_BG);
-    gfx_text(40, cy, "DR", COL_NUM, COL_BG);
-  }
+  gfx_text(2, BAR_H + 4, g_cur_title, COL_TITLE_FG, COL_BG);
+  int cy = BAR_H + 20;
+  gfx_text(2, cy, "CPU", COL_NUM, COL_BG);
+  gfx_text(30, cy, "%", COL_NUM, COL_BG);
+  gfx_text(40, cy, "DR", COL_NUM, COL_BG);
   for (int t = 0; t < PFM_PROF_N; t++) {
-    int yy = PLAY_LEGEND_Y + t * 12;
-    board_lcd_fill_rect(2, yy, 9, 9, task_col[t]);
-    gfx_text(14, yy + 1, task_lbl[t], COL_FG, COL_BG);
+    int x = 2 + (t % 3) * 43;
+    int y = (BAR_H + 34) + (t / 3) * 12;
+    board_lcd_fill_rect(x, y, 7, 7, task_col[t]);
+    gfx_text(x + 9, y, task_lbl[t], COL_FG, COL_BG);
   }
   draw_vol(g_volume);
-  gfx_text(2, H - 10, "UD:vol LR:song Ctap:lcd Chold:back", COL_NUM, COL_BG);
+  gfx_text(2, H - 10, "UD vol  LR song  Ctap lcd", COL_NUM, COL_BG);
   board_lcd_present();
 }
 
-/* Toggle the LCD-drawing flag and repaint (or blank) the screen. */
-static void toggle_lcd(int sel) {
+static void toggle_lcd(void) {
   g_lcd_on = !g_lcd_on;
   LCD_LOCK();
-  if (g_lcd_on) draw_play_chrome(sel);
-  else {
-    board_lcd_clear(COL_BG);
-    gfx_text(2, 40, "LCD off (tap C)", COL_NUM, COL_BG);
-    board_lcd_present();
-  }
+  if (g_lcd_on) draw_play_chrome();
+  else { board_lcd_clear(COL_BG); gfx_text(2, 40, "LCD off (tap C)", COL_NUM, COL_BG); board_lcd_present(); }
   LCD_UNLOCK();
 }
 
-/* Returns 0 = back to menu, -1 = previous song, +1 = next song. */
-static int play(int sel) {
-  LCD_LOCK();
-  board_lcd_clear(COL_BG);
-  gfx_text(2, BAR_H + 4, UI_NOWPLAYING, COL_TITLE_FG, COL_BG);
-  gfx_text(2, BAR_H + 28, board_storage_name(sel), COL_FG, COL_BG);
-  LCD_UNLOCK();
-
-  int len = board_storage_load(sel, g_songbuf, sizeof(g_songbuf));
-  if (len <= 0) {
-    LCD_LOCK(); gfx_text(2, 80, "load error", COL_ERR, COL_BG); board_lcd_present(); LCD_UNLOCK();
-    return 0;
-  }
+/* Play the already-loaded player singleton; `display` is the title to show.
+   Returns 0 = back to menu, -1 = previous song, +1 = next song. */
+static int play(const char *display) {
   pfm_player *p = pfm_player_instance();
-  pfm_player_init(p);
-  if (!pfm_player_load(p, g_songbuf, (size_t)len)) {
-    LCD_LOCK(); gfx_text(2, 80, "not a PMD file", COL_ERR, COL_BG); board_lcd_present(); LCD_UNLOCK();
-    return 0;
-  }
+  strncpy(g_cur_title, display, sizeof(g_cur_title) - 1);
+  g_cur_title[sizeof(g_cur_title) - 1] = 0;
 
   unsigned rate = PFM_MIX_RATE;
   board_audio_open(rate, 0);
@@ -209,19 +188,18 @@ static int play(int sel) {
 
   int ret = 0;
   int prevb = board_input_poll();
-  int c_armed = !(prevb & BTN_CENTER); /* ignore C until the start-press releases */
+  int c_armed = !(prevb & BTN_CENTER);
 
 #ifdef PFM_RTOS
-  g_cur_sel = sel;
   g_render_frames = 0;
   LCD_LOCK();
-  if (g_lcd_on) draw_play_chrome(sel);
+  if (g_lcd_on) draw_play_chrome();
   else { board_lcd_clear(COL_BG); gfx_text(2, 40, "LCD off (tap C)", COL_NUM, COL_BG); board_lcd_present(); }
   LCD_UNLOCK();
   g_playing = 1;
   TickType_t c_press = 0;
 #else
-  LCD_LOCK(); draw_play_chrome(sel); LCD_UNLOCK();
+  LCD_LOCK(); draw_play_chrome(); LCD_UNLOCK();
   int refresh = 0, c_held = 0;
   uint64_t win_frames = 0;
   uint32_t cpu_hz = board_cpu_hz(), last_drops = 0, last_cons = 0;
@@ -230,10 +208,7 @@ static int play(int sel) {
 
   for (;;) {
 #ifdef PFM_RTOS
-    /* audio task: render only when the ring needs it, else yield to LCD/idle.
-       The scheduler lets this task preempt a mid-flight LCD draw, so drawing
-       can never starve the codec. */
-    if (board_audio_ring_fill() >= (int)(AUD_HIGH_WATER)) {
+    if (board_audio_ring_fill() >= (int)AUD_HIGH_WATER) {
       vTaskDelay(1);
     } else {
       pfm_player_render(p, g_chunk, 512);
@@ -247,7 +222,6 @@ static int play(int sel) {
     done += 512;
     if (done >= cap) break;
 #endif
-
     int b = board_input_poll();
     int edge = b & ~prevb;
     if (edge & BTN_LEFT) { ret = -1; break; }
@@ -262,7 +236,6 @@ static int play(int sel) {
       if (g_lcd_on) { LCD_LOCK(); draw_vol(g_volume); LCD_UNLOCK(); }
     }
 #ifdef PFM_RTOS
-    /* CENTER: hold ~0.4s -> back to menu; short tap -> toggle LCD */
     if (b & BTN_CENTER) {
       if (c_armed) {
         if (!c_press) c_press = xTaskGetTickCount();
@@ -271,7 +244,7 @@ static int play(int sel) {
     } else {
       if (c_armed && (prevb & BTN_CENTER) && c_press &&
           (xTaskGetTickCount() - c_press) < pdMS_TO_TICKS(400))
-        toggle_lcd(sel);
+        toggle_lcd();
       c_armed = 1;
       c_press = 0;
     }
@@ -291,19 +264,17 @@ static int play(int sel) {
       uint32_t drops = board_audio_underruns(), cons = board_audio_consumed_frames();
       unsigned drpct = (cons > last_cons) ? (unsigned)((uint64_t)(drops - last_drops) * 100u / (cons - last_cons)) : 0;
       last_drops = drops; last_cons = cons;
-      if (g_lcd_on) {
-        draw_cpu_bar(snap, budget);
-        char nb[8]; int cy = BAR_H + 44;
-        unsigned pct = budget ? (unsigned)(sum * 100 / budget) : 0;
-        u2a(nb, pct > 999 ? 999 : pct, 3);
-        board_lcd_fill_rect(16, cy, 13, GFX_CH, COL_BG);
-        gfx_text(16, cy, nb, pct > 100 ? COL_ERR : COL_OK, COL_BG);
-        u2a(nb, drpct > 99 ? 99 : drpct, 1);
-        board_lcd_fill_rect(50, cy, 20, GFX_CH, COL_BG);
-        int dx = gfx_text(50, cy, nb, drpct ? COL_ERR : COL_OK, COL_BG);
-        gfx_text(dx, cy, "%", COL_NUM, COL_BG);
-        board_lcd_present();
-      }
+      draw_cpu_bar(snap, budget);
+      char nb[8]; int cy = BAR_H + 20;
+      unsigned pct = budget ? (unsigned)(sum * 100 / budget) : 0;
+      u2a(nb, pct > 999 ? 999 : pct, 3);
+      board_lcd_fill_rect(16, cy, 13, GFX_CH, COL_BG);
+      gfx_text(16, cy, nb, pct > 100 ? COL_ERR : COL_OK, COL_BG);
+      u2a(nb, drpct > 99 ? 99 : drpct, 1);
+      board_lcd_fill_rect(50, cy, 20, GFX_CH, COL_BG);
+      int dx = gfx_text(50, cy, nb, drpct ? COL_ERR : COL_OK, COL_BG);
+      gfx_text(dx, cy, "%", COL_NUM, COL_BG);
+      board_lcd_present();
     }
 #endif
   }
@@ -315,9 +286,7 @@ static int play(int sel) {
 }
 
 #ifdef PFM_RTOS
-/* Lowest-priority task: paint the playback meter. Runs only in the slices where
-   the audio task is ahead and has yielded; the audio task preempts it whenever
-   the ring needs refilling, so the display simply drops frames under load. */
+/* Lowest-priority meter task (see header). */
 void ui_lcd_task(void) {
   uint32_t last_frames = 0, last_drops = 0, last_cons = 0;
   for (;;) {
@@ -342,7 +311,7 @@ void ui_lcd_task(void) {
     if (g_playing && g_lcd_on) {
       draw_cpu_bar(snap, budget);
       char nb[8];
-      int cy = BAR_H + 44;
+      int cy = BAR_H + 20;
       unsigned pct = budget ? (unsigned)(sum * 100 / budget) : 0;
       u2a(nb, pct > 999 ? 999 : pct, 3);
       board_lcd_fill_rect(16, cy, 13, GFX_CH, COL_BG);
@@ -358,42 +327,199 @@ void ui_lcd_task(void) {
 }
 #endif
 
-void ui_run(void) {
+/* ---------------- flash-embedded fallback browser ---------------- */
+static int flash_play(int sel) {
+  int len = board_storage_load(sel, g_songbuf, sizeof(g_songbuf));
+  if (len <= 0) return 0;
+  pfm_player *p = pfm_player_instance();
+  pfm_player_init(p);
+  if (!pfm_player_load(p, g_songbuf, (size_t)len)) return 0;
+  const char *t = pfm_player_get_title(p);
+  return play((t && t[0]) ? t : board_storage_name(sel));
+}
+
+static void ui_run_flash(void) {
   int n = board_storage_count();
   if (n <= 0) {
-    board_lcd_clear(COL_BG);
-    gfx_text(4, 4, "no tracks found", COL_ERR, COL_BG);
-    board_lcd_present();
+    LCD_LOCK(); board_lcd_clear(COL_BG); gfx_text(4, 4, "no tracks", COL_ERR, COL_BG); board_lcd_present(); LCD_UNLOCK();
     return;
   }
   int sel = 0, top = 0;
-  draw_list(sel, top, n);
-  board_lcd_present();
-
+  LCD_LOCK(); draw_list(sel, top, n); LCD_UNLOCK();
   for (;;) {
     int ev = board_input_wait();
-    if (!ev) break; /* sim: input script exhausted -> exit */
+    if (!ev) break;
     if (ev == BTN_DOWN && sel < n - 1) sel++;
     else if (ev == BTN_UP && sel > 0) sel--;
-    else if (ev == BTN_RIGHT) { sel += VISROWS; if (sel > n - 1) sel = n - 1; }
-    else if (ev == BTN_LEFT) { sel -= VISROWS; if (sel < 0) sel = 0; }
     else if (ev == BTN_CENTER) {
-      int r = play(sel);
-      while (r != 0) {           /* L/R in playback -> prev/next song, keep playing */
-        sel += r;
-        if (sel < 0) sel = n - 1;
-        else if (sel >= n) sel = 0;
-        if (sel < top) top = sel;
-        if (sel >= top + VISROWS) top = sel - VISROWS + 1;
-        r = play(sel);
+      int r = flash_play(sel);
+      while (r != 0) {
+        sel += r; if (sel < 0) sel = n - 1; else if (sel >= n) sel = 0;
+        r = flash_play(sel);
       }
-      draw_list(sel, top, n);
-      board_lcd_present();
-      continue;
     }
     if (sel < top) top = sel;
     if (sel >= top + VISROWS) top = sel - VISROWS + 1;
-    draw_list(sel, top, n);
-    board_lcd_present();
+    LCD_LOCK(); draw_list(sel, top, n); LCD_UNLOCK();
   }
+}
+
+/* ---------------- SD-card hierarchical (tree) browser ---------------- */
+#ifdef PFM_RTOS
+#include "ff.h"
+static FATFS g_fatfs;
+static char g_path[256] = "/";
+#define BR_NAMELEN 48
+static char g_names[VISROWS][BR_NAMELEN];
+static uint8_t g_isdir[VISROWS];
+
+static int sd_dir_count(void) {
+  DIR dir; FILINFO fno; int n = 0;
+  if (f_opendir(&dir, g_path) != FR_OK) return 0;
+  while (f_readdir(&dir, &fno) == FR_OK && fno.fname[0]) n++;
+  f_closedir(&dir);
+  return n;
+}
+static void sd_dir_window(int top) {
+  for (int w = 0; w < VISROWS; w++) g_names[w][0] = 0;
+  DIR dir; FILINFO fno; int n = 0;
+  if (f_opendir(&dir, g_path) != FR_OK) return;
+  while (f_readdir(&dir, &fno) == FR_OK && fno.fname[0]) {
+    if (n >= top && n < top + VISROWS) {
+      int w = n - top;
+      strncpy(g_names[w], fno.fname, BR_NAMELEN - 1);
+      g_names[w][BR_NAMELEN - 1] = 0;
+      g_isdir[w] = (fno.fattrib & AM_DIR) ? 1 : 0;
+    }
+    if (++n >= top + VISROWS) break;
+  }
+  f_closedir(&dir);
+}
+static int sd_entry(int idx, char *name, int *isdir) {
+  DIR dir; FILINFO fno; int n = 0, rc = -1;
+  if (f_opendir(&dir, g_path) != FR_OK) return -1;
+  while (f_readdir(&dir, &fno) == FR_OK && fno.fname[0]) {
+    if (n == idx) {
+      strncpy(name, fno.fname, BR_NAMELEN - 1); name[BR_NAMELEN - 1] = 0;
+      *isdir = (fno.fattrib & AM_DIR) ? 1 : 0; rc = 0; break;
+    }
+    n++;
+  }
+  f_closedir(&dir);
+  return rc;
+}
+static void path_push(const char *name) {
+  int pl = (int)strlen(g_path);
+  if (pl && g_path[pl - 1] != '/' && pl < 254) g_path[pl++] = '/';
+  for (int i = 0; name[i] && pl < 254; i++) g_path[pl++] = name[i];
+  g_path[pl] = 0;
+}
+static void path_pop(void) {
+  char *last = strrchr(g_path, '/');
+  if (last && last != g_path) *last = 0;
+  else { g_path[0] = '/'; g_path[1] = 0; }
+}
+static int sd_load_file(const char *name) {
+  char full[300];
+  int pl = (int)strlen(g_path);
+  for (int i = 0; i < pl; i++) full[i] = g_path[i];
+  if (pl && full[pl - 1] != '/') full[pl++] = '/';
+  for (int i = 0; name[i] && pl < 299; i++) full[pl++] = name[i];
+  full[pl] = 0;
+  FIL fp;
+  if (f_open(&fp, full, FA_READ) != FR_OK) return -1;
+  UINT br = 0;
+  f_read(&fp, g_songbuf, sizeof(g_songbuf), &br);
+  f_close(&fp);
+  return (int)br;
+}
+static int sd_next_file(int idx, int dir, int count) {
+  for (int i = 0; i < count; i++) {
+    idx += dir; if (idx < 0) idx = count - 1; else if (idx >= count) idx = 0;
+    char nm[BR_NAMELEN]; int isd;
+    if (sd_entry(idx, nm, &isd) == 0 && !isd) return idx;
+  }
+  return -1;
+}
+static int sd_play_index(int idx) {
+  char name[BR_NAMELEN]; int isd;
+  if (sd_entry(idx, name, &isd) != 0 || isd) return 0;
+  int len = sd_load_file(name);
+  if (len <= 0) return 0;
+  pfm_player *p = pfm_player_instance();
+  pfm_player_init(p);
+  if (!pfm_player_load(p, g_songbuf, (size_t)len)) {
+    LCD_LOCK(); board_lcd_clear(COL_BG); gfx_text(2, 40, "not a PMD file", COL_ERR, COL_BG); board_lcd_present(); LCD_UNLOCK();
+    vTaskDelay(pdMS_TO_TICKS(700));
+    return 0;
+  }
+  const char *t = pfm_player_get_title(p);
+  return play((t && t[0]) ? t : name);
+}
+static void draw_browser(int sel, int top, int count) {
+  LCD_LOCK();
+  board_lcd_clear(COL_BG);
+  board_lcd_fill_rect(0, 0, W, TITLE_H, COL_TITLE_BG);
+  gfx_text(2, 4, g_path, COL_TITLE_FG, COL_TITLE_BG);
+  sd_dir_window(top);
+  for (int r = 0; r < VISROWS; r++) {
+    int idx = top + r;
+    if (idx >= count || !g_names[r][0]) break;
+    int y = LIST_Y + r * ROW_H;
+    int issel = (idx == sel);
+    uint16_t bg = issel ? COL_SEL_BG : COL_BG;
+    uint16_t fg = issel ? COL_SEL_FG : (g_isdir[r] ? COL_SUB_FG : COL_FG);
+    board_lcd_fill_rect(0, y, W, ROW_H, bg);
+    int x = 2;
+    if (g_isdir[r]) x = gfx_text(2, y + 1, "/", COL_ACCENT, bg);
+    gfx_text(x, y + 1, g_names[r], fg, bg);
+  }
+  board_lcd_fill_rect(0, H - FOOT_H, W, FOOT_H, COL_TITLE_BG);
+  gfx_text(2, H - FOOT_H + 2, "UD sel LR dir C play", COL_TITLE_FG, COL_TITLE_BG);
+  board_lcd_present();
+  LCD_UNLOCK();
+}
+static void ui_run_sd(void) {
+  int sel = 0, top = 0;
+  int count = sd_dir_count();
+  draw_browser(sel, top, count);
+  for (;;) {
+    int ev = board_input_wait();
+    if (!ev) break;
+    if (ev == BTN_DOWN) { if (sel < count - 1) sel++; }
+    else if (ev == BTN_UP) { if (sel > 0) sel--; }
+    else if (ev == BTN_LEFT) { path_pop(); sel = 0; top = 0; count = sd_dir_count(); }
+    else if (ev == BTN_RIGHT) {
+      char name[BR_NAMELEN]; int isd;
+      if (sd_entry(sel, name, &isd) == 0 && isd) { path_push(name); sel = 0; top = 0; count = sd_dir_count(); }
+    } else if (ev == BTN_CENTER) {
+      char name[BR_NAMELEN]; int isd;
+      if (sd_entry(sel, name, &isd) == 0) {
+        if (isd) { path_push(name); sel = 0; top = 0; count = sd_dir_count(); }
+        else {
+          int idx = sel;
+          for (;;) {
+            int r = sd_play_index(idx);
+            if (r == 0) break;
+            int ni = sd_next_file(idx, r, count);
+            if (ni < 0) break;
+            idx = ni;
+          }
+          sel = idx;
+        }
+      }
+    }
+    if (sel < top) top = sel;
+    if (sel >= top + VISROWS) top = sel - VISROWS + 1;
+    draw_browser(sel, top, count);
+  }
+}
+#endif
+
+void ui_run(void) {
+#ifdef PFM_RTOS
+  static FATFS *fs = &g_fatfs;
+  if (f_mount(fs, "", 1) == FR_OK) { ui_run_sd(); return; }
+#endif
+  ui_run_flash();
 }
