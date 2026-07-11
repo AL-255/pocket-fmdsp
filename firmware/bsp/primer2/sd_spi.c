@@ -134,7 +134,9 @@ int sd_init(void) {
 
   CS_HI();
   xchg(0xFF);
-  g_clk_delay = 0;                   /* data phase: full speed (no half-clock delay) */
+  g_clk_delay = 2;                   /* data phase: small settle for reliability
+                                        (SRAM already ~2x faster; reliability > raw
+                                        speed since a bad read fails the load) */
   return 0;
 }
 

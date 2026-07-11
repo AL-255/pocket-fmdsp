@@ -10,7 +10,7 @@
 #define configUSE_TICK_HOOK                     0
 #define configCPU_CLOCK_HZ                      (132000000UL) /* SYSCLK @132MHz */
 #define configTICK_RATE_HZ                      ((TickType_t)1000)
-#define configMAX_PRIORITIES                    3
+#define configMAX_PRIORITIES                    4
 #define configMINIMAL_STACK_SIZE                ((unsigned short)80)
 #define configMAX_TASK_NAME_LEN                 8
 #define configUSE_16_BIT_TICKS                  0

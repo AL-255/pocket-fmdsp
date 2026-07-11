@@ -8,9 +8,11 @@
 #include "FreeRTOS.h"
 #include "task.h"
 
-/* fully static allocation — no heap */
-static StaticTask_t s_app_tcb, s_lcd_tcb, s_idle_tcb;
-static StackType_t s_app_stack[1024]; /* FatFs FIL carries a 512B sector buffer */
+/* fully static allocation — no heap. Priorities: audio(3) > ui(2) > lcd(1) > idle.
+   The audio task only renders, so nothing (SD load, input, drawing) can stall it. */
+static StaticTask_t s_audio_tcb, s_app_tcb, s_lcd_tcb, s_idle_tcb;
+static StackType_t s_audio_stack[512]; /* OPNA render chain */
+static StackType_t s_app_stack[768];   /* UI + FatFs (FIL carries a 512B sector buffer) */
 static StackType_t s_lcd_stack[256];
 static StackType_t s_idle_stack[configMINIMAL_STACK_SIZE];
 
@@ -21,9 +23,13 @@ void vApplicationGetIdleTaskMemory(StaticTask_t **tcb, StackType_t **stack,
   *size = configMINIMAL_STACK_SIZE;
 }
 
+static void audio_task(void *arg) {
+  (void)arg;
+  ui_audio_task();        /* OPNA render -> ring (highest priority) */
+}
 static void app_task(void *arg) {
   (void)arg;
-  ui_run();               /* menu + playback (high priority) */
+  ui_run();               /* input + pages */
   for (;;) vTaskDelay(1000);
 }
 static void lcd_task(void *arg) {
@@ -34,7 +40,10 @@ static void lcd_task(void *arg) {
 int main(void) {
   board_init();
   ui_init();
-  xTaskCreateStatic(app_task, "app", 1024, NULL, 2, s_app_stack, &s_app_tcb);
+  TaskHandle_t audio_h =
+    xTaskCreateStatic(audio_task, "opna", 512, NULL, 3, s_audio_stack, &s_audio_tcb);
+  ui_set_audio_handle(audio_h);
+  xTaskCreateStatic(app_task, "app", 768, NULL, 2, s_app_stack, &s_app_tcb);
   xTaskCreateStatic(lcd_task, "lcd", 256, NULL, 1, s_lcd_stack, &s_lcd_tcb);
   vTaskStartScheduler();
   for (;;) {
