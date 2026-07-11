@@ -2430,6 +2430,28 @@ static void pmd_cmdd5_detrel(
   part->detune += u16s16(val);
 }
 
+// pocket-fmdsp: SRAM shadow for the inline loop counters, so `data` is read-only.
+// First touch seeds from the file's initial byte; accesses are at sequencer-tick
+// rate (not per-sample), so the linear scan is negligible.
+static uint8_t pmd_loopctr_get(struct driver_pmd *pmd, uint16_t off) {
+  for (uint16_t i = 0; i < pmd->loopctr_n; i++)
+    if (pmd->loopctr_off[i] == off) return pmd->loopctr_val[i];
+  return pmd->data[off];
+}
+static void pmd_loopctr_set(struct driver_pmd *pmd, uint16_t off, uint8_t val) {
+  for (uint16_t i = 0; i < pmd->loopctr_n; i++)
+    if (pmd->loopctr_off[i] == off) { pmd->loopctr_val[i] = val; return; }
+  if (pmd->loopctr_n >= PMD_LOOPCTR_MAX) return;   // overflow (rare): drop
+  pmd->loopctr_off[pmd->loopctr_n] = off;
+  pmd->loopctr_val[pmd->loopctr_n] = val;
+  pmd->loopctr_n++;
+}
+static uint8_t pmd_loopctr_inc(struct driver_pmd *pmd, uint16_t off) {
+  uint8_t v = (uint8_t)(pmd_loopctr_get(pmd, off) + 1);
+  pmd_loopctr_set(pmd, off, v);
+  return v;
+}
+
 // 237b
 static void pmd_cmdf9_repeat_reset(
   struct fmdriver_work *work,
@@ -2444,7 +2466,7 @@ static void pmd_cmdf9_repeat_reset(
     // TODO: better error handling
     part->ptr = 0;
   } else {
-    pmd->data[ptr] = 0;
+    pmd_loopctr_set(pmd, ptr, 0);   // was: pmd->data[ptr] = 0
   }
 }
 
@@ -2462,8 +2484,8 @@ static void pmd_cmdf8_repeat(
       part->ptr = 0;
       return;
     }
-    pmd->data[part->ptr]++;
-    uint8_t repeatcnt = pmd_part_cmdload(pmd, part);
+    uint8_t repeatcnt = pmd_loopctr_inc(pmd, part->ptr); // was: data[ptr]++; cmdload
+    part->ptr++;                                          // (cmdload advanced ptr by 1)
     if (repeat == repeatcnt) {
       part->ptr += 2;
       return;
@@ -2494,8 +2516,8 @@ static void pmd_cmdf7_repeat_exit(
     part->ptr = 0;
     return;
   }
-  uint8_t repeat = pmd->data[ptr];
-  uint8_t repeatcnt = pmd->data[ptr+1];
+  uint8_t repeat = pmd->data[ptr];                     // repeat target (read-only)
+  uint8_t repeatcnt = pmd_loopctr_get(pmd, ptr+1);     // counter (SRAM shadow)
   if (repeatcnt == (repeat-1)) {
     part->ptr = ptr+4;
   }
@@ -5934,6 +5956,7 @@ bool pmd_load(struct driver_pmd *pmd,
   if (!datalen) return false;
   pmd->data = data + 1;
   pmd->datalen = datalen - 1;
+  pmd->loopctr_n = 0;   // fresh loop-counter shadow per song
   pmd_reset_state(pmd);
   pmd->ssgeff_num = 0xff;
   if (!pmd_data_init(pmd)) return false;
