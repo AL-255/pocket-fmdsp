@@ -41,7 +41,8 @@
 static uint8_t g_songbuf[22 * 1024]; /* >= SONG_MAX_LEN (21071); rest freed for .ramfunc */
 static int16_t g_chunk[512 * 2];
 static int g_volume = 5;             /* 0..BOARD_VOL_MAX, persists across songs */
-static int g_lcd_on = 1;             /* tap C toggles LCD drawing during playback */
+static int g_backlight = 5;          /* 0..BOARD_BL_MAX backlight brightness */
+static int g_paused;                 /* 1 = playback paused (short tap C on play page) */
 
 #ifdef PFM_RTOS
 #include "FreeRTOS.h"
@@ -207,6 +208,13 @@ static int b_sel, b_top, b_count;
 static char g_play_path[256];    /* dir the playing song lives in (for prev/next) */
 static int  g_play_idx;
 
+/* playback mode: what to do when the current track finishes a play-through */
+enum { PM_NORMAL = 0, PM_SINGLE = 1, PM_FLOOP = 2, PM_FRAND = 3, PM_N = 4 };
+static const char *const pm_name[PM_N] = { "Normal", "Single Track Loop", "Folder Loop", "Folder Random" };
+static int g_play_mode = PM_NORMAL;
+static unsigned g_prev_lc;       /* previous loop count (for track-end edge detect) */
+static uint32_t g_rng = 0x2545f491u; /* folder-random LCG state */
+
 /* --- settings: hierarchical per-channel mute tree ---
    Output, then FM (folds open to FM0..FM5), SSG (folds open to SSG0..SSG2),
    Drum, PCM. Default enables FM0-2 + SSG0 (a PC-9801-26K-ish voicing at ~3-FM
@@ -218,19 +226,23 @@ static uint8_t g_drum_mute = 0;
 static uint8_t g_pcm_mute  = 1;                        /* ppz8 PCM muted by default */
 static int g_fm_open, g_ssg_open;                      /* folder expansion */
 static int st_sel, st_top;                             /* selection index + scroll top */
+static int g_cfg_status;                               /* Save row feedback: 0 none, 1 ok, -1 err */
 
-enum { K_OUTPUT, K_FM, K_FMCH, K_SSG, K_SSGCH, K_DRUM, K_PCM };
-static struct { uint8_t kind, ch; } g_srow[16];
+enum { K_OUTPUT, K_BL, K_FM, K_FMCH, K_SSG, K_SSGCH, K_DRUM, K_PCM, K_SAVE, K_DEFAULT };
+static struct { uint8_t kind, ch; } g_srow[20];
 static int g_nsrow;
 static void build_srows(void) {
   int n = 0;
   g_srow[n].kind = K_OUTPUT; g_srow[n++].ch = 0;
+  g_srow[n].kind = K_BL;     g_srow[n++].ch = 0;
   g_srow[n].kind = K_FM;     g_srow[n++].ch = 0;
   if (g_fm_open) for (int c = 0; c < 6; c++) { g_srow[n].kind = K_FMCH; g_srow[n++].ch = c; }
   g_srow[n].kind = K_SSG;    g_srow[n++].ch = 0;
   if (g_ssg_open) for (int c = 0; c < 3; c++) { g_srow[n].kind = K_SSGCH; g_srow[n++].ch = c; }
   g_srow[n].kind = K_DRUM;   g_srow[n++].ch = 0;
   g_srow[n].kind = K_PCM;    g_srow[n++].ch = 0;
+  g_srow[n].kind = K_SAVE;   g_srow[n++].ch = 0;
+  g_srow[n].kind = K_DEFAULT;g_srow[n++].ch = 0;
   g_nsrow = n;
 }
 static int fm_on_count(void) { int n = 0; for (int c = 0; c < 6; c++) if (!g_fm_mute[c]) n++; return n; }
@@ -309,23 +321,28 @@ static int src_load_idx(int idx) {
    blocks; this task does the actual (blocking) FatFs read and posts back, so the
    read runs uninterrupted at the top priority. */
 static TaskHandle_t g_sd_task, g_app_task;
-static volatile int g_sd_req_idx, g_sd_result;
+static volatile int g_sd_req_idx, g_sd_result, g_sd_op;
+enum { SDOP_LOAD = 0, SDOP_SAVECFG = 1 };
+static int cfg_write_file(void);   /* forward decl; runs on the sd task */
 void ui_set_task_handles(void *sd, void *app) {
   g_sd_task = (TaskHandle_t)sd; g_app_task = (TaskHandle_t)app;
 }
 void ui_sd_task(void) {
   for (;;) {
-    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);   /* wait for a load request */
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);   /* wait for a request */
     uint32_t t0 = DWT_CYCCNT;
-    g_sd_result = src_load_idx(g_sd_req_idx);  /* the actual SD read */
-    pfm_prof_cyc[PFM_PROF_SD] += DWT_CYCCNT - t0; /* show read time in the CPU bar */
+    /* All FatFs access is serialised on this task (FatFs is single-threaded): song
+       reads and the config write both run here so they can't collide. */
+    if (g_sd_op == SDOP_SAVECFG) g_sd_result = cfg_write_file();
+    else g_sd_result = src_load_idx(g_sd_req_idx);
+    pfm_prof_cyc[PFM_PROF_SD] += DWT_CYCCNT - t0; /* show SD time in the CPU bar */
     if (g_app_task) xTaskNotifyGive(g_app_task);
   }
 }
 /* Called from the app task: run the SD read on the top-priority sd task and wait. */
 static int sd_load(int idx) {
   if (!g_sd_task || !g_app_task) return src_load_idx(idx);  /* fallback */
-  g_sd_req_idx = idx;
+  g_sd_op = SDOP_LOAD; g_sd_req_idx = idx;
   xTaskNotifyGive(g_sd_task);                  /* sd task preempts + reads */
   ulTaskNotifyTake(pdTRUE, portMAX_DELAY);     /* block until it's done */
   return g_sd_result;
@@ -340,6 +357,96 @@ static void src_window(int top) {
     src_entry(idx, g_names[w], &isd);
     g_isdir[w] = (uint8_t)isd;
   }
+}
+
+/* ---------- config file (/fmdsp.cfg, ASCII key=value) ---------- */
+static void cfg_defaults(void) {
+  g_out_speaker = 0; g_volume = 5; g_backlight = 5;
+  g_fm_mute[0]=0; g_fm_mute[1]=0; g_fm_mute[2]=0; g_fm_mute[3]=1; g_fm_mute[4]=1; g_fm_mute[5]=1;
+  g_ssg_mute[0]=0; g_ssg_mute[1]=1; g_ssg_mute[2]=1;
+  g_drum_mute = 0; g_pcm_mute = 1; g_play_mode = PM_NORMAL;
+}
+static char *cfg_putkv(char *d, const char *k, int v) {
+  while (*k) *d++ = *k++;
+  *d++ = '=';
+  char t[6]; int n = 0;
+  if (v <= 0) t[n++] = '0'; else { int x = v; while (x) { t[n++] = (char)('0' + x % 10); x /= 10; } }
+  while (n) *d++ = t[--n];
+  *d++ = '\n';
+  return d;
+}
+static char *cfg_putbits(char *d, const char *k, const uint8_t *m, int n) {
+  while (*k) *d++ = *k++;
+  *d++ = '=';
+  for (int c = 0; c < n; c++) *d++ = (char)('0' + (m[c] ? 1 : 0));
+  *d++ = '\n';
+  return d;
+}
+static int cfg_build(char *buf) {
+  char *d = buf;
+  d = cfg_putkv(d, "out", g_out_speaker);
+  d = cfg_putkv(d, "vol", g_volume);
+  d = cfg_putkv(d, "bl", g_backlight);
+  d = cfg_putbits(d, "fm", g_fm_mute, 6);
+  d = cfg_putbits(d, "ssg", g_ssg_mute, 3);
+  d = cfg_putkv(d, "drum", g_drum_mute);
+  d = cfg_putkv(d, "pcm", g_pcm_mute);
+  d = cfg_putkv(d, "mode", g_play_mode);
+  return (int)(d - buf);
+}
+static int cfg_geti(const char *v) {
+  int n = 0; while (*v >= '0' && *v <= '9') { n = n * 10 + (*v - '0'); v++; } return n;
+}
+static int cfg_clamp(int x, int hi) { return x < 0 ? 0 : (x > hi ? hi : x); }
+static void cfg_parse(char *buf, int len) {
+  buf[len] = 0;
+  char *p = buf;
+  while (*p) {
+    char *line = p;
+    while (*p && *p != '\n' && *p != '\r') p++;
+    char *eol = p;
+    while (*p == '\n' || *p == '\r') p++;
+    *eol = 0;
+    char *eq = line; while (*eq && *eq != '=') eq++;
+    if (*eq != '=') continue;
+    *eq = 0; char *key = line, *val = eq + 1;
+    if      (!strcmp(key, "out"))  g_out_speaker = cfg_geti(val) ? 1 : 0;
+    else if (!strcmp(key, "vol"))  g_volume    = cfg_clamp(cfg_geti(val), BOARD_VOL_MAX);
+    else if (!strcmp(key, "bl"))   g_backlight = cfg_clamp(cfg_geti(val), BOARD_BL_MAX);
+    else if (!strcmp(key, "fm"))   for (int c = 0; c < 6 && val[c]; c++) g_fm_mute[c]  = (val[c] == '1');
+    else if (!strcmp(key, "ssg"))  for (int c = 0; c < 3 && val[c]; c++) g_ssg_mute[c] = (val[c] == '1');
+    else if (!strcmp(key, "drum")) g_drum_mute = cfg_geti(val) ? 1 : 0;
+    else if (!strcmp(key, "pcm"))  g_pcm_mute  = cfg_geti(val) ? 1 : 0;
+    else if (!strcmp(key, "mode")) { int x = cfg_geti(val); g_play_mode = (x >= 0 && x < PM_N) ? x : PM_NORMAL; }
+  }
+}
+static int cfg_write_file(void) {   /* runs on the sd task (see ui_sd_task) */
+  FIL fp;
+  if (f_open(&fp, "/fmdsp.cfg", FA_WRITE | FA_CREATE_ALWAYS) != FR_OK) return 0;
+  char buf[128];
+  int n = cfg_build(buf);
+  UINT bw = 0;
+  int ok = (f_write(&fp, buf, (UINT)n, &bw) == FR_OK && bw == (UINT)n);
+  f_close(&fp);
+  return ok;
+}
+static void cfg_load(void) {   /* app task, at boot: no file -> keep defaults */
+  FIL fp;
+  if (f_open(&fp, "/fmdsp.cfg", FA_READ) != FR_OK) return;
+  char buf[200];
+  UINT br = 0;
+  if (f_read(&fp, buf, sizeof(buf) - 1, &br) == FR_OK) cfg_parse(buf, (int)br);
+  f_close(&fp);
+}
+static int cfg_save(void) {   /* app task: run the write on the sd task, mute across it */
+  if (!g_sd_task || !g_app_task) return cfg_write_file();  /* sim fallback */
+  int playing = g_song_loaded && !g_paused && !g_muted_swap;
+  if (playing) board_audio_mute(1);
+  g_sd_op = SDOP_SAVECFG;
+  xTaskNotifyGive(g_sd_task);
+  ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+  if (playing) board_audio_mute(0);
+  return g_sd_result;
 }
 
 /* ---------- playback screen ---------- */
@@ -409,15 +516,12 @@ static void draw_play_chrome(void) {
   }
   draw_vol(g_volume);
   draw_dbg();
-  gfx_text(2, HINT_Y + 1, "holdC page UDvol LRsong", COL_NUM, COL_BG);
+  { char ms[28]; strcpy(ms, g_paused ? "|| " : ""); strcat(ms, pm_name[g_play_mode]);
+    gfx_text(2, PLAY_DBG_Y + 22, ms, g_paused ? COL_ERR : COL_ACCENT, COL_BG); }
+  gfx_text(2, HINT_Y + 1, "tapC pause  2xC mode", COL_NUM, COL_BG);
   draw_tab_bar();
   board_lcd_present();
 }
-static void draw_play_page(void) {   /* run only on the lcd task */
-  if (g_lcd_on) draw_play_chrome();
-  else { board_lcd_clear(COL_BG); gfx_text(2, 40, "LCD off (tap C)", COL_NUM, COL_BG); board_lcd_present(); }
-}
-static void toggle_lcd(void) { g_lcd_on = !g_lcd_on; ui_request(RDR_FULL); }
 
 /* ---------- browser screen ---------- */
 static void draw_browser_rows(void) {
@@ -480,8 +584,17 @@ static void draw_srow(int r) {   /* r = visible row 0..VISROWS-1 */
                 muted = g_ssg_mute[ch]; strcpy(val, muted ? "Mute" : "On"); break;
   case K_DRUM: strcpy(lbl, "Drum"); muted = g_drum_mute; strcpy(val, muted ? "Mute" : "On"); break;
   case K_PCM:  strcpy(lbl, "PCM"); muted = g_pcm_mute; strcpy(val, muted ? "Mute" : "On"); break;
+  case K_BL:   strcpy(lbl, "Backlight"); val[0] = 0; break;   /* value shown as a bar */
+  case K_SAVE: strcpy(lbl, "Save"); strcpy(val, g_cfg_status == 1 ? "saved" : (g_cfg_status == -1 ? "err" : "to SD")); break;
+  case K_DEFAULT: strcpy(lbl, "Default"); strcpy(val, "reset"); break;
   }
   gfx_text(indent, y + 1, lbl, fg, bg);
+  if (kind == K_BL) {                          /* brightness slider bar */
+    int bw = 44, fw = g_backlight * bw / BOARD_BL_MAX;
+    board_lcd_fill_rect(70, y + 3, bw, 4, COL_SUB_BG);
+    board_lcd_fill_rect(70, y + 3, fw, 4, sel ? COL_SEL_FG : COL_BAR);
+    return;
+  }
   uint16_t vc = sel ? COL_SEL_FG : (folder ? COL_SUB_FG : (muted ? COL_ERR : COL_ACCENT));
   gfx_text(70, y + 1, val, vc, bg);
 }
@@ -507,7 +620,7 @@ static void draw_settings_full(void) {
 /* ---------- redraw dispatch (lcd task only) ---------- */
 static void draw_current_full(void) {
   if (g_page == PG_BROWSER) draw_browser_full();
-  else if (g_page == PG_PLAY) draw_play_page();
+  else if (g_page == PG_PLAY) draw_play_chrome();
   else draw_settings_full();
 }
 static void draw_current_rows(void) {
@@ -543,6 +656,17 @@ static void settings_activate(pfm_player *p) {
   int kind = g_srow[st_sel].kind, ch = g_srow[st_sel].ch;
   if (kind == K_FM)  { g_fm_open  = !g_fm_open;  ui_request(RDR_FULL); }
   else if (kind == K_SSG) { g_ssg_open = !g_ssg_open; ui_request(RDR_FULL); }
+  else if (kind == K_BL) { g_backlight = (g_backlight + 1) % (BOARD_BL_MAX + 1);
+                           board_lcd_backlight(g_backlight); ui_request(RDR_ROWS); }
+  else if (kind == K_SAVE) { g_cfg_status = cfg_save() ? 1 : -1; ui_request(RDR_ROWS); }
+  else if (kind == K_DEFAULT) {                 /* restore factory config in memory only */
+    cfg_defaults();
+    board_audio_set_output(g_out_speaker);
+    board_audio_set_volume(g_volume);
+    board_lcd_backlight(g_backlight);
+    if (g_song_loaded) apply_mute(p);
+    g_cfg_status = 0; ui_request(RDR_FULL);
+  }
   else settings_toggle_leaf(p, kind, ch);
 }
 /* Load file entry `idx` of the current browse dir and make it the playing song.
@@ -582,6 +706,8 @@ static int start_song(pfm_player *p, int idx) {
   g_render_frames = 0;
   g_unmute_cons = board_audio_consumed_frames() + 1024; /* unmute once old tail drains */
   g_song_loaded = 1;
+  g_paused = 0;                 /* a freshly-started track always plays */
+  g_prev_lc = 0;               /* re-arm end-of-track detection for the new track */
   return 1;
 fail:
   /* Read/parse failed; g_songbuf is now clobbered so the old song is gone. Stop
@@ -606,6 +732,53 @@ static void play_step(pfm_player *p, int dir) {
   strcpy(g_path, saved);
   if (g_page == PG_PLAY) ui_request(RDR_FULL);
 }
+/* Folder Random: jump to a random (different) track in the playing folder. */
+static void play_random(pfm_player *p) {
+  if (!g_song_loaded) return;
+  g_rng = g_rng * 1664525u + 1013904223u + DWT_CYCCNT;
+  char saved[256]; strcpy(saved, g_path); strcpy(g_path, g_play_path);
+  int cnt = src_count(), found = -1, start = cnt ? (int)(g_rng % (unsigned)cnt) : 0;
+  for (int i = 0; i < cnt; i++) {
+    int idx = (start + i) % cnt;
+    char nm[BR_NAMELEN]; int isd;
+    if (src_entry(idx, nm, &isd) == 0 && !isd && idx != g_play_idx) { found = idx; break; }
+  }
+  if (found >= 0) start_song(p, found);   /* else: only one track -> keep looping */
+  strcpy(g_path, saved);
+  if (g_page == PG_PLAY) ui_request(RDR_FULL);
+}
+/* Normal: advance to the next track, stopping (last track keeps looping) at the end. */
+static void play_next_stop(pfm_player *p) {
+  if (!g_song_loaded) return;
+  char saved[256]; strcpy(saved, g_path); strcpy(g_path, g_play_path);
+  int cnt = src_count(), found = -1;
+  for (int i = g_play_idx + 1; i < cnt; i++) {
+    char nm[BR_NAMELEN]; int isd;
+    if (src_entry(i, nm, &isd) == 0 && !isd) { found = i; break; }
+  }
+  if (found >= 0) start_song(p, found);
+  strcpy(g_path, saved);
+  if (g_page == PG_PLAY) ui_request(RDR_FULL);
+}
+/* Called once when the current track finishes a play-through (see the render loop). */
+static void play_advance(pfm_player *p) {
+  switch (g_play_mode) {
+  case PM_SINGLE: break;                     /* let the track loop naturally */
+  case PM_FLOOP:  play_step(p, +1); break;   /* next, wrapping to the first */
+  case PM_FRAND:  play_random(p); break;
+  case PM_NORMAL: default: play_next_stop(p); break;
+  }
+}
+static void cycle_play_mode(void) {
+  g_play_mode = (g_play_mode + 1) % PM_N;
+  g_prev_lc = 0;                              /* re-arm end-of-track for the new mode */
+  ui_request(RDR_FULL);
+}
+static void toggle_pause(void) {
+  g_paused = !g_paused;
+  board_audio_mute(g_paused ? 1 : 0);
+  ui_request(RDR_FULL);
+}
 
 /* ---------- page dispatch ---------- */
 static void cycle_page(void) {
@@ -618,11 +791,10 @@ static void page_center(pfm_player *p) {
     if (src_entry(b_sel, name, &isd) != 0) return;
     if (isd) { path_push(name); browse_reload(); ui_request(RDR_FULL); }
     else { start_song(p, b_sel); g_page = PG_PLAY; ui_request(RDR_FULL); }
-  } else if (g_page == PG_PLAY) {
-    toggle_lcd();
-  } else {                              /* settings: open/close folder or toggle leaf */
+  } else if (g_page == PG_SETTINGS) {   /* open/close folder or change value */
     settings_activate(p);
   }
+  /* PG_PLAY short/double taps (pause / mode) are handled in the input loop. */
 }
 static void page_nav(pfm_player *p, int edge) {
   if (g_page == PG_BROWSER) {
@@ -643,7 +815,7 @@ static void page_nav(pfm_player *p, int edge) {
       if ((edge & BTN_UP) && g_volume < BOARD_VOL_MAX) g_volume++;
       else if ((edge & BTN_DOWN) && g_volume > 0) g_volume--;
       board_audio_set_volume(g_volume);
-      if (g_lcd_on) ui_request(RDR_VOL);
+      ui_request(RDR_VOL);
     } else if (edge & BTN_RIGHT) play_step(p, +1);
     else if (edge & BTN_LEFT) play_step(p, -1);
   } else {                              /* settings — same scheme as the file browser:
@@ -658,11 +830,15 @@ static void page_nav(pfm_player *p, int edge) {
         int *open = (kind == K_FM) ? &g_fm_open : &g_ssg_open;
         int want = (edge & BTN_RIGHT) ? 1 : 0;
         if (*open != want) { *open = want; ui_request(RDR_FULL); }
+      } else if (kind == K_BL) {                        /* brightness slider: L dimmer, R brighter */
+        if ((edge & BTN_RIGHT) && g_backlight < BOARD_BL_MAX) g_backlight++;
+        else if ((edge & BTN_LEFT) && g_backlight > 0) g_backlight--;
+        board_lcd_backlight(g_backlight); ui_request(RDR_ROWS);
       } else if (edge & BTN_LEFT) {                     /* left inside a folder exits to it */
-        if (kind == K_FMCH)  { g_fm_open = 0;  st_sel = 1; ui_request(RDR_FULL); }
-        else if (kind == K_SSGCH) { g_ssg_open = 0; st_sel = 2 + (g_fm_open ? 6 : 0); ui_request(RDR_FULL); }
+        if (kind == K_FMCH)  { g_fm_open = 0;  st_sel = 2; ui_request(RDR_FULL); }
+        else if (kind == K_SSGCH) { g_ssg_open = 0; st_sel = 3 + (g_fm_open ? 6 : 0); ui_request(RDR_FULL); }
       }
-      /* right on a channel, or L/R on Output/Drum/PCM: no-op — use C to change the value */
+      /* right on a channel, or L/R on Output/Drum/PCM/Save/Default: no-op — use C */
     }
   }
 }
@@ -683,7 +859,7 @@ void ui_lcd_task(void) {
       if (req & RDR_FULL) draw_current_full();
       else {
         if (req & RDR_ROWS) draw_current_rows();
-        if ((req & RDR_VOL) && g_page == PG_PLAY && g_lcd_on) { draw_vol(g_volume); board_lcd_present(); }
+        if ((req & RDR_VOL) && g_page == PG_PLAY) { draw_vol(g_volume); board_lcd_present(); }
       }
       LCD_UNLOCK();
     }
@@ -691,7 +867,7 @@ void ui_lcd_task(void) {
     /* 2. live meter (play page only) */
     /* Skip while swapping songs: the load stalls the producer (muted, so silent)
        and would otherwise register as CPU/DR noise. Re-baseline and wait. */
-    if (g_page != PG_PLAY || !g_song_loaded || !g_lcd_on || g_muted_swap) {
+    if (g_page != PG_PLAY || !g_song_loaded || g_paused || g_muted_swap) {
       last_frames = g_render_frames;
       last_drops = board_audio_underruns();
       last_cons = board_audio_consumed_frames();
@@ -708,7 +884,7 @@ void ui_lcd_task(void) {
     last_drops = drops; last_cons = cons;
     unsigned pct = budget ? (unsigned)(sum * 100 / budget) : 0;
     LCD_LOCK();
-    if (g_page == PG_PLAY && g_song_loaded && g_lcd_on) {
+    if (g_page == PG_PLAY && g_song_loaded && !g_paused) {
       draw_cpu_bar(snap, budget);
       draw_meter_numbers(pct, drpct);
       draw_dbg();
@@ -722,18 +898,26 @@ void ui_run(void) {
   pfm_player *p = pfm_player_instance();
   g_mount_rc = f_mount(&g_fatfs, "", 1);
   g_have_sd = (g_mount_rc == FR_OK);
-  strcpy(g_path, "/");
+  cfg_defaults();                       /* factory config, then overlay the saved file */
+  if (g_have_sd) cfg_load();            /* restore /fmdsp.cfg if present */
+  board_lcd_backlight(g_backlight);
   board_audio_set_output(g_out_speaker);
+  /* default browse dir: /fmdsp if it exists, else / */
+  strcpy(g_path, "/");
+  if (g_have_sd) {
+    DIR d;
+    if (f_opendir(&d, "/fmdsp") == FR_OK) { f_closedir(&d); strcpy(g_path, "/fmdsp"); }
+  }
   browse_reload();
   g_page = PG_BROWSER;
   ui_request(RDR_FULL);
 
   int prevb = board_input_poll();
-  TickType_t c_press = 0, last_nav = 0, last_yield = 0, held_since = 0;
+  TickType_t c_press = 0, last_nav = 0, last_yield = 0, held_since = 0, pending_tap = 0;
   int c_armed = !(prevb & BTN_CENTER), c_done = 0, held_dir = 0;
   for (;;) {
     int rendered = 0;
-    if (g_song_loaded && board_audio_ring_fill() < (int)AUD_HIGH_WATER) {
+    if (g_song_loaded && !g_paused && board_audio_ring_fill() < (int)AUD_HIGH_WATER) {
       pfm_player_render(p, g_chunk, 512);
       board_audio_write(g_chunk, 512);
       g_render_frames += 512;
@@ -741,6 +925,13 @@ void ui_run(void) {
     }
     if (g_muted_swap && board_audio_consumed_frames() >= g_unmute_cons) {
       board_audio_mute(0); g_muted_swap = 0;
+    }
+    /* End of track -> playback-mode action (once per play-through). Skipped while
+       paused or mid-swap; play_advance() may start a new track (loop count reset). */
+    if (g_song_loaded && !g_paused && !g_muted_swap) {
+      unsigned lc = pfm_player_loopcount(p);
+      if (lc >= 1 && g_prev_lc < 1) play_advance(p);
+      g_prev_lc = pfm_player_loopcount(p);
     }
     int b = board_input_poll();
     int edge = b & ~prevb;
@@ -751,8 +942,21 @@ void ui_run(void) {
         else if ((now - c_press) >= pdMS_TO_TICKS(500)) { cycle_page(); c_done = 1; }
       }
     } else {
-      if (c_armed && (prevb & BTN_CENTER) && !c_done && c_press) page_center(p);
+      if (c_armed && (prevb & BTN_CENTER) && !c_done && c_press) {
+        /* short tap. On the play page a single tap toggles pause and a double tap
+           cycles the playback mode, so the single action is deferred ~300 ms to
+           tell them apart; other pages act immediately. */
+        if (g_page == PG_PLAY) {
+          if (pending_tap && (now - pending_tap) < pdMS_TO_TICKS(300)) {
+            cycle_play_mode(); pending_tap = 0;
+          } else pending_tap = now ? now : 1;
+        } else page_center(p);
+      }
       c_armed = 1; c_press = 0; c_done = 0;
+    }
+    if (pending_tap && (now - pending_tap) >= pdMS_TO_TICKS(300)) {
+      if (g_page == PG_PLAY) toggle_pause();     /* confirmed single tap: pause/resume */
+      pending_tap = 0;
     }
     /* Nav: the initial press fires immediately (110 ms debounce); then while UP or
        DOWN is held past 0.5 s it auto-repeats every 70 ms (rapid fire). LR don't
