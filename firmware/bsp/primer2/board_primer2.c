@@ -122,14 +122,13 @@ static void clock_init(void) {
     if ((RCC_CFGR & 0xCu) == 0x8u) break;      /* SWS = PLL */
 }
 
+/* Busy-wait via the DWT cycle counter (SysTick belongs to the FreeRTOS tick). */
 static void delay_ms(uint32_t ms) {
-  SYST_RVR = (SYSCLK_HZ / 1000u) - 1u;
-  SYST_CVR = 0;
-  SYST_CSR = 5u; /* enable, core clock, no IRQ */
+  volatile uint32_t *cyccnt = (volatile uint32_t *)0xE0001004u; /* DWT_CYCCNT */
   while (ms--) {
-    while (!(SYST_CSR & (1u << 16))) {} /* COUNTFLAG */
+    uint32_t start = *cyccnt;
+    while ((*cyccnt - start) < (SYSCLK_HZ / 1000u)) {}
   }
-  SYST_CSR = 0;
 }
 
 /* ---------------- LCD (ST7732 over FSMC) ---------------- */

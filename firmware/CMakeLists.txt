@@ -74,6 +74,11 @@ endfunction()
 # Stage 1: LED blinky (validates flash + execute)
 add_hw_target(pocketfm_blinky startup/startup.c app/blinky.c)
 
+# FreeRTOS kernel (minimal, fully static) — hardware target only
+set(FREERTOS_SRC
+  freertos/tasks.c freertos/list.c freertos/queue.c freertos/portable/port.c)
+set_source_files_properties(${FREERTOS_SRC} PROPERTIES COMPILE_OPTIONS "-w;-O2")
+
 # Stage 2: the player firmware (FSMC/ST7732 LCD + joystick + songs in flash)
 add_hw_target(pocketfm_hw
   startup/startup.c
@@ -83,9 +88,11 @@ add_hw_target(pocketfm_hw
   app/main_hw.c
   ${CORE_SRC}
   ${VENDOR_SRC}
+  ${FREERTOS_SRC}
 )
-target_include_directories(pocketfm_hw PRIVATE gen)
+target_include_directories(pocketfm_hw PRIVATE gen
+  freertos freertos/include freertos/portable)
 # place the per-sample render functions in 0-wait SRAM (.ramfunc)
-target_compile_definitions(pocketfm_hw PRIVATE PFM_RAMFUNC=1)
+target_compile_definitions(pocketfm_hw PRIVATE PFM_RAMFUNC=1 PFM_RTOS=1)
 # emulate YM2203 (OPN, PC-9801-26K): 3 FM channels instead of the OPNA's 6
 target_compile_definitions(pocketfm_hw PRIVATE PFM_FM_CH=3)

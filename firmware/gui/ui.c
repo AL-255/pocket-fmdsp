@@ -39,6 +39,26 @@ static int16_t g_chunk[512 * 2];
 static int g_volume = 5;             /* 0..BOARD_VOL_MAX, persists across songs */
 static int g_lcd_on = 1;             /* tap C toggles LCD drawing during playback */
 
+#ifdef PFM_RTOS
+#include "FreeRTOS.h"
+#include "task.h"
+#include "semphr.h"
+static SemaphoreHandle_t g_lcd_mtx;
+static StaticSemaphore_t g_lcd_mtx_buf;
+static volatile int g_playing;          /* 1 while a song is rendering */
+static volatile int g_cur_sel;          /* song index being played */
+static volatile uint32_t g_render_frames; /* cumulative frames produced */
+#define AUD_HIGH_WATER 1536 /* frames: yield to LCD when the ring is this full */
+#define LCD_LOCK()   xSemaphoreTake(g_lcd_mtx, portMAX_DELAY)
+#define LCD_UNLOCK() xSemaphoreGive(g_lcd_mtx)
+void ui_init(void) { g_lcd_mtx = xSemaphoreCreateMutexStatic(&g_lcd_mtx_buf); }
+#else
+#define LCD_LOCK()   ((void)0)
+#define LCD_UNLOCK() ((void)0)
+void ui_init(void) {}
+void ui_lcd_task(void) {}
+#endif
+
 static void u2a(char *d, unsigned v, int width) { /* right-aligned decimal */
   char t[8];
   int n = 0;
@@ -149,106 +169,131 @@ static void draw_play_chrome(int sel) {
   board_lcd_present();
 }
 
+/* Toggle the LCD-drawing flag and repaint (or blank) the screen. */
+static void toggle_lcd(int sel) {
+  g_lcd_on = !g_lcd_on;
+  LCD_LOCK();
+  if (g_lcd_on) draw_play_chrome(sel);
+  else {
+    board_lcd_clear(COL_BG);
+    gfx_text(2, 40, "LCD off (tap C)", COL_NUM, COL_BG);
+    board_lcd_present();
+  }
+  LCD_UNLOCK();
+}
+
 /* Returns 0 = back to menu, -1 = previous song, +1 = next song. */
 static int play(int sel) {
+  LCD_LOCK();
   board_lcd_clear(COL_BG);
   gfx_text(2, BAR_H + 4, UI_NOWPLAYING, COL_TITLE_FG, COL_BG);
-  const char *grp = board_storage_group(sel);
-  if (grp && grp[0]) gfx_text(2, BAR_H + 16, grp, COL_SUB_FG, COL_BG);
   gfx_text(2, BAR_H + 28, board_storage_name(sel), COL_FG, COL_BG);
+  LCD_UNLOCK();
 
   int len = board_storage_load(sel, g_songbuf, sizeof(g_songbuf));
   if (len <= 0) {
-    gfx_text(2, 80, "load error", COL_ERR, COL_BG);
-    board_lcd_present();
+    LCD_LOCK(); gfx_text(2, 80, "load error", COL_ERR, COL_BG); board_lcd_present(); LCD_UNLOCK();
     return 0;
   }
   pfm_player *p = pfm_player_instance();
   pfm_player_init(p);
   if (!pfm_player_load(p, g_songbuf, (size_t)len)) {
-    gfx_text(2, 80, "not a PMD file", COL_ERR, COL_BG);
-    board_lcd_present();
+    LCD_LOCK(); gfx_text(2, 80, "not a PMD file", COL_ERR, COL_BG); board_lcd_present(); LCD_UNLOCK();
     return 0;
   }
 
   unsigned rate = PFM_MIX_RATE;
   board_audio_open(rate, 0);
   board_audio_set_volume(g_volume);
+  for (int t = 0; t < PFM_PROF_N; t++) pfm_prof_cyc[t] = 0;
+
+  int ret = 0;
+  int prevb = board_input_poll();
+  int c_armed = !(prevb & BTN_CENTER); /* ignore C until the start-press releases */
+
+#ifdef PFM_RTOS
+  g_cur_sel = sel;
+  g_render_frames = 0;
+  LCD_LOCK();
   if (g_lcd_on) draw_play_chrome(sel);
   else { board_lcd_clear(COL_BG); gfx_text(2, 40, "LCD off (tap C)", COL_NUM, COL_BG); board_lcd_present(); }
-
-  for (int t = 0; t < PFM_PROF_N; t++) pfm_prof_cyc[t] = 0;
-  uint32_t cpu_hz = board_cpu_hz();
+  LCD_UNLOCK();
+  g_playing = 1;
+  TickType_t c_press = 0;
+#else
+  LCD_LOCK(); draw_play_chrome(sel); LCD_UNLOCK();
+  int refresh = 0, c_held = 0;
   uint64_t win_frames = 0;
-  int refresh = 0, ret = 0, c_held = 0;
-  int prevb = board_input_poll(); /* current held buttons (e.g. the start-press) */
-  int c_armed = !(prevb & BTN_CENTER); /* ignore C until the start-press releases */
-  uint32_t last_drops = 0, last_cons = 0; /* for the windowed drop-rate */
-#ifdef PFM_SIM
-  uint32_t cap = rate * PLAY_SECONDS, done = 0; /* bounded render for the WAV harness */
+  uint32_t cpu_hz = board_cpu_hz(), last_drops = 0, last_cons = 0;
+  uint32_t cap = rate * PLAY_SECONDS, done = 0;
 #endif
 
   for (;;) {
-    unsigned n = 512;
-    pfm_player_render(p, g_chunk, n);
-    board_audio_write(g_chunk, n);
-    win_frames += n;
-#ifdef PFM_SIM
-    done += n;
-    if (done >= cap) break;
+#ifdef PFM_RTOS
+    /* audio task: render only when the ring needs it, else yield to LCD/idle.
+       The scheduler lets this task preempt a mid-flight LCD draw, so drawing
+       can never starve the codec. */
+    if (board_audio_ring_fill() >= (int)(AUD_HIGH_WATER)) {
+      vTaskDelay(1);
+    } else {
+      pfm_player_render(p, g_chunk, 512);
+      board_audio_write(g_chunk, 512);
+      g_render_frames += 512;
+    }
 #else
+    pfm_player_render(p, g_chunk, 512);
+    board_audio_write(g_chunk, 512);
+    win_frames += 512;
+    done += 512;
+    if (done >= cap) break;
+#endif
+
     int b = board_input_poll();
-    int edge = b & ~prevb; /* new presses only */
+    int edge = b & ~prevb;
     if (edge & BTN_LEFT) { ret = -1; break; }
     else if (edge & BTN_RIGHT) { ret = 1; break; }
     else if (edge & BTN_UP) {
       if (g_volume < BOARD_VOL_MAX) g_volume++;
       board_audio_set_volume(g_volume);
-      if (g_lcd_on) draw_vol(g_volume);
+      if (g_lcd_on) { LCD_LOCK(); draw_vol(g_volume); LCD_UNLOCK(); }
     } else if (edge & BTN_DOWN) {
       if (g_volume > 0) g_volume--;
       board_audio_set_volume(g_volume);
-      if (g_lcd_on) draw_vol(g_volume);
+      if (g_lcd_on) { LCD_LOCK(); draw_vol(g_volume); LCD_UNLOCK(); }
     }
-    /* CENTER: hold ~0.4s -> back to menu; short tap -> toggle LCD drawing */
+#ifdef PFM_RTOS
+    /* CENTER: hold ~0.4s -> back to menu; short tap -> toggle LCD */
     if (b & BTN_CENTER) {
-      if (c_armed && ++c_held >= 40) { ret = 0; break; }
-    } else {
-      if (c_armed && (prevb & BTN_CENTER) && c_held > 0 && c_held < 40) {
-        g_lcd_on = !g_lcd_on;
-        if (g_lcd_on) draw_play_chrome(sel);
-        else { board_lcd_clear(COL_BG); gfx_text(2, 40, "LCD off (tap C)", COL_NUM, COL_BG); board_lcd_present(); }
+      if (c_armed) {
+        if (!c_press) c_press = xTaskGetTickCount();
+        else if ((xTaskGetTickCount() - c_press) >= pdMS_TO_TICKS(400)) { ret = 0; break; }
       }
+    } else {
+      if (c_armed && (prevb & BTN_CENTER) && c_press &&
+          (xTaskGetTickCount() - c_press) < pdMS_TO_TICKS(400))
+        toggle_lcd(sel);
       c_armed = 1;
-      c_held = 0;
+      c_press = 0;
     }
-    prevb = b;
+#else
+    (void)c_armed;
 #endif
+    prevb = b;
 
+#ifndef PFM_RTOS
     if (++refresh >= 8) {
       refresh = 0;
       uint32_t snap[PFM_PROF_N];
       uint64_t sum = 0;
-      for (int t = 0; t < PFM_PROF_N; t++) {
-        snap[t] = pfm_prof_cyc[t];
-        pfm_prof_cyc[t] = 0;
-        sum += snap[t];
-      }
-      uint64_t budget = win_frames * cpu_hz / rate; /* realtime cycles for the window */
+      for (int t = 0; t < PFM_PROF_N; t++) { snap[t] = pfm_prof_cyc[t]; pfm_prof_cyc[t] = 0; sum += snap[t]; }
+      uint64_t budget = win_frames * cpu_hz / rate;
       win_frames = 0;
-      /* drop RATE this window: dropped frames / real-time frames, as a percent */
-      uint32_t drops = board_audio_underruns();
-      uint32_t cons = board_audio_consumed_frames();
-      unsigned drpct = (cons > last_cons)
-          ? (unsigned)((uint64_t)(drops - last_drops) * 100u / (cons - last_cons)) : 0;
-      last_drops = drops;
-      last_cons = cons;
-      /* LCD is lowest priority: only paint when audio has spare buffer, so a
-         redraw can never starve the codec. Under load the meter drops frames. */
-      if (g_lcd_on && board_audio_ring_fill() > 256) {
+      uint32_t drops = board_audio_underruns(), cons = board_audio_consumed_frames();
+      unsigned drpct = (cons > last_cons) ? (unsigned)((uint64_t)(drops - last_drops) * 100u / (cons - last_cons)) : 0;
+      last_drops = drops; last_cons = cons;
+      if (g_lcd_on) {
         draw_cpu_bar(snap, budget);
-        char nb[8];
-        int cy = BAR_H + 44;
+        char nb[8]; int cy = BAR_H + 44;
         unsigned pct = budget ? (unsigned)(sum * 100 / budget) : 0;
         u2a(nb, pct > 999 ? 999 : pct, 3);
         board_lcd_fill_rect(16, cy, 13, GFX_CH, COL_BG);
@@ -260,10 +305,58 @@ static int play(int sel) {
         board_lcd_present();
       }
     }
+#endif
   }
+#ifdef PFM_RTOS
+  g_playing = 0;
+#endif
   board_audio_close();
   return ret;
 }
+
+#ifdef PFM_RTOS
+/* Lowest-priority task: paint the playback meter. Runs only in the slices where
+   the audio task is ahead and has yielded; the audio task preempts it whenever
+   the ring needs refilling, so the display simply drops frames under load. */
+void ui_lcd_task(void) {
+  uint32_t last_frames = 0, last_drops = 0, last_cons = 0;
+  for (;;) {
+    vTaskDelay(pdMS_TO_TICKS(60));
+    if (!g_playing || !g_lcd_on) {
+      last_frames = g_render_frames;
+      last_drops = board_audio_underruns();
+      last_cons = board_audio_consumed_frames();
+      continue;
+    }
+    uint32_t snap[PFM_PROF_N];
+    uint64_t sum = 0;
+    for (int t = 0; t < PFM_PROF_N; t++) { snap[t] = pfm_prof_cyc[t]; pfm_prof_cyc[t] = 0; sum += snap[t]; }
+    uint32_t frames = g_render_frames, df = frames - last_frames;
+    last_frames = frames;
+    uint64_t budget = (uint64_t)df * board_cpu_hz() / PFM_MIX_RATE;
+    uint32_t drops = board_audio_underruns(), cons = board_audio_consumed_frames();
+    unsigned drpct = (cons > last_cons) ? (unsigned)((uint64_t)(drops - last_drops) * 100u / (cons - last_cons)) : 0;
+    last_drops = drops;
+    last_cons = cons;
+    LCD_LOCK();
+    if (g_playing && g_lcd_on) {
+      draw_cpu_bar(snap, budget);
+      char nb[8];
+      int cy = BAR_H + 44;
+      unsigned pct = budget ? (unsigned)(sum * 100 / budget) : 0;
+      u2a(nb, pct > 999 ? 999 : pct, 3);
+      board_lcd_fill_rect(16, cy, 13, GFX_CH, COL_BG);
+      gfx_text(16, cy, nb, pct > 100 ? COL_ERR : COL_OK, COL_BG);
+      u2a(nb, drpct > 99 ? 99 : drpct, 1);
+      board_lcd_fill_rect(50, cy, 20, GFX_CH, COL_BG);
+      int dx = gfx_text(50, cy, nb, drpct ? COL_ERR : COL_OK, COL_BG);
+      gfx_text(dx, cy, "%", COL_NUM, COL_BG);
+      board_lcd_present();
+    }
+    LCD_UNLOCK();
+  }
+}
+#endif
 
 void ui_run(void) {
   int n = board_storage_count();

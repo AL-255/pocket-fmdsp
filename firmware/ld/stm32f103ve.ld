@@ -12,7 +12,7 @@ MEMORY
 
 _estack = ORIGIN(RAM) + LENGTH(RAM);   /* top of stack */
 _Min_Heap_Size  = 0x0;                  /* freestanding: no malloc */
-_Min_Stack_Size = 0x1000;
+_Min_Stack_Size = 0x800;                /* MSP: ISRs only (tasks use their own PSP) */
 
 SECTIONS
 {

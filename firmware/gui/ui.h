@@ -2,5 +2,7 @@
 #define PFM_UI_H
 /* Track-list GUI: list songs from storage, navigate with the joystick, play the
    selected one. Renders via the board LCD HAL; drives the player via board audio. */
-void ui_run(void);
+void ui_init(void);     /* create shared resources (LCD mutex); call before tasks */
+void ui_run(void);      /* app/audio task: menu + playback loop */
+void ui_lcd_task(void); /* low-priority task: draws the playback meter (RTOS only) */
 #endif
