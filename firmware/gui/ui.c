@@ -606,8 +606,8 @@ static void page_center(pfm_player *p) {
 static void page_nav(pfm_player *p, int edge) {
   if (g_page == PG_BROWSER) {
     int full = 0;
-    if (edge & BTN_DOWN) { if (b_sel < b_count - 1) b_sel++; }
-    else if (edge & BTN_UP) { if (b_sel > 0) b_sel--; }
+    if (edge & BTN_DOWN) { if (b_count > 0) b_sel = (b_sel + 1) % b_count; }        /* wrap */
+    else if (edge & BTN_UP) { if (b_count > 0) b_sel = (b_sel + b_count - 1) % b_count; } /* wrap */
     else if (edge & BTN_RIGHT) {       /* descend */
       char name[BR_NAMELEN]; int isd;
       if (g_have_sd && src_entry(b_sel, name, &isd) == 0 && isd) { path_push(name); browse_reload(); full = 1; }
@@ -625,18 +625,23 @@ static void page_nav(pfm_player *p, int edge) {
       if (g_lcd_on) ui_request(RDR_VOL);
     } else if (edge & BTN_RIGHT) play_step(p, +1);
     else if (edge & BTN_LEFT) play_step(p, -1);
-  } else {                              /* settings */
+  } else {                              /* settings — same scheme as the file browser:
+                                           UD move (wrap), LR enter/exit submenus, C changes value */
     build_srows();
     if (st_sel >= g_nsrow) st_sel = g_nsrow - 1;
-    if (edge & BTN_DOWN) { if (st_sel < g_nsrow - 1) st_sel++; ui_request(RDR_ROWS); }
-    else if (edge & BTN_UP) { if (st_sel > 0) st_sel--; ui_request(RDR_ROWS); }
+    if (edge & BTN_DOWN) { st_sel = (st_sel + 1) % g_nsrow; ui_request(RDR_ROWS); }        /* wrap */
+    else if (edge & BTN_UP) { st_sel = (st_sel + g_nsrow - 1) % g_nsrow; ui_request(RDR_ROWS); } /* wrap */
     else if (edge & (BTN_LEFT | BTN_RIGHT)) {
-      int kind = g_srow[st_sel].kind, ch = g_srow[st_sel].ch;
-      if (kind == K_FM || kind == K_SSG) {   /* right opens the folder, left closes it */
+      int kind = g_srow[st_sel].kind;
+      if (kind == K_FM || kind == K_SSG) {              /* right opens, left closes the folder */
         int *open = (kind == K_FM) ? &g_fm_open : &g_ssg_open;
         int want = (edge & BTN_RIGHT) ? 1 : 0;
         if (*open != want) { *open = want; ui_request(RDR_FULL); }
-      } else settings_toggle_leaf(p, kind, ch);
+      } else if (edge & BTN_LEFT) {                     /* left inside a folder exits to it */
+        if (kind == K_FMCH)  { g_fm_open = 0;  st_sel = 1; ui_request(RDR_FULL); }
+        else if (kind == K_SSGCH) { g_ssg_open = 0; st_sel = 2 + (g_fm_open ? 6 : 0); ui_request(RDR_FULL); }
+      }
+      /* right on a channel, or L/R on Output/Drum/PCM: no-op — use C to change the value */
     }
   }
 }
@@ -703,8 +708,8 @@ void ui_run(void) {
   ui_request(RDR_FULL);
 
   int prevb = board_input_poll();
-  TickType_t c_press = 0, last_nav = 0, last_yield = 0;
-  int c_armed = !(prevb & BTN_CENTER), c_done = 0;
+  TickType_t c_press = 0, last_nav = 0, last_yield = 0, held_since = 0;
+  int c_armed = !(prevb & BTN_CENTER), c_done = 0, held_dir = 0;
   for (;;) {
     int rendered = 0;
     if (g_song_loaded && board_audio_ring_fill() < (int)AUD_HIGH_WATER) {
@@ -728,9 +733,19 @@ void ui_run(void) {
       if (c_armed && (prevb & BTN_CENTER) && !c_done && c_press) page_center(p);
       c_armed = 1; c_press = 0; c_done = 0;
     }
-    if ((edge & (BTN_UP | BTN_DOWN | BTN_LEFT | BTN_RIGHT)) &&
-        (now - last_nav) >= pdMS_TO_TICKS(110)) {
-      page_nav(p, edge);
+    /* Nav: the initial press fires immediately (110 ms debounce); then while UP or
+       DOWN is held past 0.5 s it auto-repeats every 70 ms (rapid fire). LR don't
+       auto-repeat. */
+    int nav = edge & (BTN_UP | BTN_DOWN | BTN_LEFT | BTN_RIGHT);
+    int ud = b & (BTN_UP | BTN_DOWN);
+    if (ud == BTN_UP || ud == BTN_DOWN) {
+      if (held_dir != ud) { held_dir = ud; held_since = now; }
+    } else held_dir = 0;
+    if (nav) {
+      if ((now - last_nav) >= pdMS_TO_TICKS(110)) { page_nav(p, nav); last_nav = now; }
+    } else if (held_dir && (now - held_since) >= pdMS_TO_TICKS(500) &&
+               (now - last_nav) >= pdMS_TO_TICKS(70)) {
+      page_nav(p, held_dir);
       last_nav = now;
     }
     prevb = b;
