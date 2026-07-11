@@ -176,6 +176,21 @@ static uint32_t g_unmute_cons;   /* consumed-frame count at which to lift the sw
 static int g_muted_swap;         /* codec muted across a song swap */
 static int g_dbg_len;            /* last load: bytes read (>0) or negative error */
 
+/* Redraw requests. The app task (prio 2, which also renders audio) NEVER draws:
+   it mutates UI state and OR-s a bit here; the low-priority lcd task (prio 1)
+   does the FSMC drawing. Because the render task out-prioritises the lcd task,
+   drawing can no longer stall the render -> no ring underrun / sample-repeat
+   glitch when browsing or switching pages. */
+#define RDR_FULL 1u              /* full current-page redraw */
+#define RDR_ROWS 2u              /* rows-only (browser/settings list) */
+#define RDR_VOL  4u              /* volume bar (play page) */
+static volatile uint32_t g_redraw;
+static void ui_request(uint32_t bits) {
+  taskENTER_CRITICAL();
+  g_redraw |= bits;
+  taskEXIT_CRITICAL();
+}
+
 /* --- browser (SD only) --- */
 static FATFS g_fatfs;
 static int g_have_sd;
@@ -357,13 +372,11 @@ static void draw_play_chrome(void) {
   gfx_text(2, H - 10, "holdC pages UDvol LRsong", COL_NUM, COL_BG);
   board_lcd_present();
 }
-static void toggle_lcd(void) {
-  g_lcd_on = !g_lcd_on;
-  LCD_LOCK();
+static void draw_play_page(void) {   /* run only on the lcd task */
   if (g_lcd_on) draw_play_chrome();
   else { board_lcd_clear(COL_BG); gfx_text(2, 40, "LCD off (tap C)", COL_NUM, COL_BG); board_lcd_present(); }
-  LCD_UNLOCK();
 }
+static void toggle_lcd(void) { g_lcd_on = !g_lcd_on; ui_request(RDR_FULL); }
 
 /* ---------- browser screen ---------- */
 static void draw_browser_rows(void) {
@@ -430,6 +443,17 @@ static void draw_settings_full(void) {
   draw_settings_rows();
 }
 
+/* ---------- redraw dispatch (lcd task only) ---------- */
+static void draw_current_full(void) {
+  if (g_page == PG_BROWSER) draw_browser_full();
+  else if (g_page == PG_PLAY) draw_play_page();
+  else draw_settings_full();
+}
+static void draw_current_rows(void) {
+  if (g_page == PG_BROWSER) draw_browser_rows();
+  else if (g_page == PG_SETTINGS) draw_settings_rows();
+}
+
 /* ---------- audio control ---------- */
 static void apply_mute(pfm_player *p) {
   pfm_player_set_mute(p, g_mute[0], g_mute[1], g_mute[2], g_mute[3]);
@@ -493,24 +517,20 @@ static void play_step(pfm_player *p, int dir) {
   }
   if (found >= 0) start_song(p, found);
   strcpy(g_path, saved);
-  if (g_page == PG_PLAY) { LCD_LOCK(); draw_play_chrome(); LCD_UNLOCK(); }
+  if (g_page == PG_PLAY) ui_request(RDR_FULL);
 }
 
 /* ---------- page dispatch ---------- */
 static void cycle_page(void) {
   g_page = (g_page + 1) % PG_N;
-  LCD_LOCK();
-  if (g_page == PG_BROWSER) draw_browser_full();
-  else if (g_page == PG_PLAY) draw_play_chrome();
-  else draw_settings_full();
-  LCD_UNLOCK();
+  ui_request(RDR_FULL);
 }
 static void page_center(pfm_player *p) {
   if (g_page == PG_BROWSER) {
     char name[BR_NAMELEN]; int isd;
     if (src_entry(b_sel, name, &isd) != 0) return;
-    if (isd) { path_push(name); browse_reload(); LCD_LOCK(); draw_browser_full(); LCD_UNLOCK(); }
-    else { start_song(p, b_sel); g_page = PG_PLAY; LCD_LOCK(); draw_play_chrome(); LCD_UNLOCK(); }
+    if (isd) { path_push(name); browse_reload(); ui_request(RDR_FULL); }
+    else { start_song(p, b_sel); g_page = PG_PLAY; ui_request(RDR_FULL); }
   } else if (g_page == PG_PLAY) {
     toggle_lcd();
   } else {                              /* settings: toggle selected item */
@@ -518,7 +538,7 @@ static void page_center(pfm_player *p) {
     else g_mute[st_sel - 1] = !g_mute[st_sel - 1];
     board_audio_set_output(g_out_speaker);
     if (g_song_loaded) apply_mute(p);
-    LCD_LOCK(); draw_settings_rows(); LCD_UNLOCK();
+    ui_request(RDR_ROWS);
   }
 }
 static void page_nav(pfm_player *p, int edge) {
@@ -534,35 +554,50 @@ static void page_nav(pfm_player *p, int edge) {
     }
     if (b_sel < b_top) b_top = b_sel;
     if (b_sel >= b_top + VISROWS) b_top = b_sel - VISROWS + 1;
-    LCD_LOCK();
-    if (full) draw_browser_full(); else draw_browser_rows();
-    LCD_UNLOCK();
+    ui_request(full ? RDR_FULL : RDR_ROWS);
   } else if (g_page == PG_PLAY) {
     if (edge & (BTN_UP | BTN_DOWN)) {
       if ((edge & BTN_UP) && g_volume < BOARD_VOL_MAX) g_volume++;
       else if ((edge & BTN_DOWN) && g_volume > 0) g_volume--;
       board_audio_set_volume(g_volume);
-      if (g_lcd_on) { LCD_LOCK(); draw_vol(g_volume); board_lcd_present(); LCD_UNLOCK(); }
+      if (g_lcd_on) ui_request(RDR_VOL);
     } else if (edge & BTN_RIGHT) play_step(p, +1);
     else if (edge & BTN_LEFT) play_step(p, -1);
   } else {                              /* settings */
-    if (edge & BTN_DOWN) { if (st_sel < NSET - 1) st_sel++; LCD_LOCK(); draw_settings_rows(); LCD_UNLOCK(); }
-    else if (edge & BTN_UP) { if (st_sel > 0) st_sel--; LCD_LOCK(); draw_settings_rows(); LCD_UNLOCK(); }
+    if (edge & BTN_DOWN) { if (st_sel < NSET - 1) st_sel++; ui_request(RDR_ROWS); }
+    else if (edge & BTN_UP) { if (st_sel > 0) st_sel--; ui_request(RDR_ROWS); }
     else if (edge & (BTN_LEFT | BTN_RIGHT)) {
       if (st_sel == 0) g_out_speaker = !g_out_speaker;
       else g_mute[st_sel - 1] = !g_mute[st_sel - 1];
       board_audio_set_output(g_out_speaker);
       if (g_song_loaded) apply_mute(p);
-      LCD_LOCK(); draw_settings_rows(); LCD_UNLOCK();
+      ui_request(RDR_ROWS);
     }
   }
 }
 
-/* lowest-priority meter task: paints only on the Playback page */
+/* lowest-priority draw task: services redraw requests (browser/settings/pages)
+   AND paints the meter on the Playback page. All FSMC drawing lives here, below
+   the render task, so a draw can never starve the codec ring. */
 void ui_lcd_task(void) {
   uint32_t last_frames = 0, last_drops = 0, last_cons = 0;
   for (;;) {
-    vTaskDelay(pdMS_TO_TICKS(60));
+    vTaskDelay(pdMS_TO_TICKS(30));
+
+    /* 1. explicit redraw requests from the app task */
+    uint32_t req;
+    taskENTER_CRITICAL(); req = g_redraw; g_redraw = 0; taskEXIT_CRITICAL();
+    if (req) {
+      LCD_LOCK();
+      if (req & RDR_FULL) draw_current_full();
+      else {
+        if (req & RDR_ROWS) draw_current_rows();
+        if ((req & RDR_VOL) && g_page == PG_PLAY && g_lcd_on) { draw_vol(g_volume); board_lcd_present(); }
+      }
+      LCD_UNLOCK();
+    }
+
+    /* 2. live meter (play page only) */
     /* Skip while swapping songs: the load stalls the producer (muted, so silent)
        and would otherwise register as CPU/DR noise. Re-baseline and wait. */
     if (g_page != PG_PLAY || !g_song_loaded || !g_lcd_on || g_muted_swap) {
@@ -600,7 +635,7 @@ void ui_run(void) {
   board_audio_set_output(g_out_speaker);
   browse_reload();
   g_page = PG_BROWSER;
-  LCD_LOCK(); draw_browser_full(); LCD_UNLOCK();
+  ui_request(RDR_FULL);
 
   int prevb = board_input_poll();
   TickType_t c_press = 0, last_nav = 0, last_yield = 0;
