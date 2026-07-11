@@ -70,14 +70,22 @@ PFM_HOT void opna_ssg_mix(struct opna_ssg *ssg, struct opna_ssg_resampler *r,
      that fall in each output step (4 or 5) directly. Drops the whole ring + FIR
      memory traffic; slightly more aliasing on the square/noise channels. */
   static const int32_t inv[6] = { 0, 0, 0, 0, 8192, 6554 }; /* Q15 1/4, 1/5 */
-  const unsigned tp[3] = { tone_period(ssg, 0), tone_period(ssg, 1), tone_period(ssg, 2) };
+  const unsigned tp0 = tone_period(ssg, 0), tp1 = tone_period(ssg, 1), tp2 = tone_period(ssg, 2);
   const unsigned np = (unsigned)noise_period(ssg);
   const unsigned ep = (unsigned)env_period(ssg);
   const unsigned reg7 = ssg->regs[0x7];
-  const bool cenv[3] = { chan_env(ssg, 0), chan_env(ssg, 1), chan_env(ssg, 2) };
-  const int tv[3] = { (tone_volume(ssg,0)<<1)+1, (tone_volume(ssg,1)<<1)+1, (tone_volume(ssg,2)<<1)+1 };
-  const unsigned tdis[3] = { reg7 & 1, (reg7 >> 1) & 1, (reg7 >> 2) & 1 };
-  const unsigned ndis[3] = { (reg7 >> 3) & 1, (reg7 >> 4) & 1, (reg7 >> 5) & 1 };
+  const bool ce0 = chan_env(ssg, 0), ce1 = chan_env(ssg, 1), ce2 = chan_env(ssg, 2);
+  const bool anyenv = ce0 || ce1 || ce2;
+  /* Fixed (non-env) channel volumes precomputed -> no per-tick voltable[] SRAM
+     read in the common melody case; env channels use the per-tick venv below. */
+  const int volc0 = voltable[(tone_volume(ssg,0)<<1)+1];
+  const int volc1 = voltable[(tone_volume(ssg,1)<<1)+1];
+  const int volc2 = voltable[(tone_volume(ssg,2)<<1)+1];
+  const unsigned td0 = reg7 & 1, td1 = (reg7 >> 1) & 1, td2 = (reg7 >> 2) & 1;
+  const unsigned nd0 = (reg7 >> 3) & 1, nd1 = (reg7 >> 4) & 1, nd2 = (reg7 >> 5) & 1;
+  /* tforce = period<8 forces the tone gate high; bothdis = tone+noise disabled. */
+  const bool tf0 = tp0 < 8, tf1 = tp1 < 8, tf2 = tp2 < 8;
+  const bool bd0 = td0 && nd0, bd1 = td1 && nd1, bd2 = td2 && nd2;
   const unsigned mask = ssg->mask;
   const bool ealt = ssg->env_alt, ehld = ssg->env_hld;
 
@@ -112,22 +120,19 @@ PFM_HOT void opna_ssg_mix(struct opna_ssg *ssg, struct opna_ssg_resampler *r,
         }
       }
       const unsigned lfsr1 = lfsr & 1;
-      const int envlvl = eatt ? el : 31 - el;
-      if (++tc0 >= tp[0]) { tc0 = 0; to0 = !to0; }
-      if (++tc1 >= tp[1]) { tc1 = 0; to1 = !to1; }
-      if (++tc2 >= tp[2]) { tc2 = 0; to2 = !to2; }
-      int l0 = cenv[0] ? envlvl : tv[0];
-      int l1 = cenv[1] ? envlvl : tv[1];
-      int l2 = cenv[2] ? envlvl : tv[2];
-      if (!(tdis[0] && ndis[0]))
-        s0 += ((tp[0] < 8 ? true : to0) || tdis[0]) && (lfsr1 || ndis[0]) ? voltable[l0] : -(int)voltable[l0];
-      else s0 += voltable[l0] * 2;
-      if (!(tdis[1] && ndis[1]))
-        s1 += ((tp[1] < 8 ? true : to1) || tdis[1]) && (lfsr1 || ndis[1]) ? voltable[l1] : -(int)voltable[l1];
-      else s1 += voltable[l1] * 2;
-      if (!(tdis[2] && ndis[2]))
-        s2 += ((tp[2] < 8 ? true : to2) || tdis[2]) && (lfsr1 || ndis[2]) ? voltable[l2] : -(int)voltable[l2];
-      else s2 += voltable[l2] * 2;
+      const int venv = anyenv ? (int)voltable[eatt ? el : 31 - el] : 0;
+      if (++tc0 >= tp0) { tc0 = 0; to0 = !to0; }
+      if (++tc1 >= tp1) { tc1 = 0; to1 = !to1; }
+      if (++tc2 >= tp2) { tc2 = 0; to2 = !to2; }
+      int v0 = ce0 ? venv : volc0;
+      int v1 = ce1 ? venv : volc1;
+      int v2 = ce2 ? venv : volc2;
+      if (!bd0) s0 += ((tf0 || to0 || td0) && (lfsr1 || nd0)) ? v0 : -v0;
+      else s0 += v0 * 2;
+      if (!bd1) s1 += ((tf1 || to1 || td1) && (lfsr1 || nd1)) ? v1 : -v1;
+      else s1 += v1 * 2;
+      if (!bd2) s2 += ((tf2 || to2 || td2) && (lfsr1 || nd2)) ? v2 : -v2;
+      else s2 += v2 * 2;
     }
     int32_t rr = inv[ticks];
     int32_t sample = 0;
