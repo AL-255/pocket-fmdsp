@@ -2,13 +2,11 @@
 #define PFM_OPNA_DRUM_H_INCLUDED
 
 /*
- * OPNA rhythm block: 6 PCM drum voices (BD/SD/TOP/HH/TOM/RIM) from the 8kB
- * YM2608 ADPCM-A rhythm ROM. Unlike 98fmplayer (which pre-expands the ROM to
- * ~105kB of int16 PCM in RAM), we keep the raw 8kB ROM in flash/SD and decode
- * on the fly, holding only per-voice decoder state (~24B x 6).
- *
- * The ROM is optional: if opna_drum_set_rom() is never called (rom==NULL), the
- * drum voices stay silent.
+ * OPNA rhythm block: 6 drum voices (BD/SD/TOP/HH/TOM/RIM). The authentic YM2608
+ * rhythm is a 4-bit ADPCM-A ROM, but that ROM isn't available here, so we play
+ * the FMPMDE 44.1kHz PCM recordings of those 6 samples (embedded in flash via
+ * firmware/tools/gen_drumpcm.py -> opna_drum_pcm.h), resampled to the mix rate.
+ * Each voice keeps only a fractional read position; sample data lives in flash.
  */
 
 #include "pfm/pfm_config.h"
@@ -17,31 +15,27 @@
 extern "C" {
 #endif
 
-#define PFM_DRUM_ROM_SIZE 0x2000 /* 8192 bytes */
+#define PFM_DRUM_ROM_SIZE 0x2000 /* legacy: kept so ADPCM-ROM callers still build */
 
 struct opna_drum_voice {
-  unsigned start;  /* first nibble index (start_byte << 1) */
-  unsigned end;    /* stop when (addr>>1) == end (byte) */
-  unsigned div;    /* output-sample replication per decoded nibble (3 or 6) */
+  const int16_t *data;   /* PCM sample (flash), NULL if unavailable */
+  unsigned len;          /* sample count */
+  uint32_t pos;          /* Q16.16 read position into data */
   bool playing;
-  unsigned addr;   /* current nibble index */
-  int acc;         /* ADPCM accumulator */
-  int step;        /* ADPCM step index (0..48) */
-  unsigned sub;    /* 0..div-1 replication counter */
-  int16_t cur;     /* current decoded sample (<<4) */
-  uint8_t level;   /* 0..31 per-voice attenuation */
+  uint8_t level;         /* 0..31 per-voice attenuation */
   bool left, right;
 };
 
 struct opna_drum {
-  const uint8_t *rom;      /* 8kB ADPCM-A ROM, or NULL */
   struct opna_drum_voice v[6];
   unsigned total_level;    /* 0..63 */
   unsigned mask;           /* 1<<d masks voice d */
+  uint32_t step;           /* Q16.16 read advance per output sample (rate ratio) */
 };
 
 void opna_drum_reset(struct opna_drum *drum);
-void opna_drum_set_rom(struct opna_drum *drum, const uint8_t *rom /* 8192 bytes */);
+/* Legacy no-op: the drum now plays embedded PCM, not an external ADPCM ROM. */
+void opna_drum_set_rom(struct opna_drum *drum, const uint8_t *rom);
 void opna_drum_writereg(struct opna_drum *drum, unsigned reg, unsigned val);
 void opna_drum_mix(struct opna_drum *drum, int16_t *buf, unsigned samples);
 
