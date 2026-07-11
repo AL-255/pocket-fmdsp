@@ -776,6 +776,7 @@ static void cycle_play_mode(void) {
 }
 static void toggle_pause(void) {
   g_paused = !g_paused;
+  if (g_paused) memset(g_chunk, 0, sizeof g_chunk); /* the paused feed pushes silence */
   board_audio_mute(g_paused ? 1 : 0);
   ui_request(RDR_FULL);
 }
@@ -917,10 +918,12 @@ void ui_run(void) {
   int c_armed = !(prevb & BTN_CENTER), c_done = 0, held_dir = 0;
   for (;;) {
     int rendered = 0;
-    if (g_song_loaded && !g_paused && board_audio_ring_fill() < (int)AUD_HIGH_WATER) {
-      pfm_player_render(p, g_chunk, 512);
+    if (g_song_loaded && board_audio_ring_fill() < (int)AUD_HIGH_WATER) {
+      /* Keep feeding the ring even while paused (silence). If the producer stops,
+         the DMA read pointer wraps unmetered and the consumed counter drifts, so
+         ring_fill reads high forever and playback never resumes. */
+      if (!g_paused) { pfm_player_render(p, g_chunk, 512); g_render_frames += 512; }
       board_audio_write(g_chunk, 512);
-      g_render_frames += 512;
       rendered = 1;
     }
     if (g_muted_swap && board_audio_consumed_frames() >= g_unmute_cons) {
