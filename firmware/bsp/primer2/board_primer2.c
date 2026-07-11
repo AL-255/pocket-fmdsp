@@ -101,9 +101,9 @@ static int pin_get(uint32_t base, int pin) { return (GPIO_IDR(base) >> pin) & 1u
    that exact value, so pitch stays correct at any of these clock choices. To
    change the overclock, edit PLL_MUL only (and re-check I2S_I2SDIV for ~48 kHz). */
 #define HSE_HZ     12000000u
-#define PLL_MUL    11u                       /* overclock search: x11 -> 132 MHz */
-#define SYSCLK_HZ  (HSE_HZ * PLL_MUL)       /* 132 MHz */
-#define APB1_HZ    (SYSCLK_HZ / 4u)         /* 33 MHz (PPRE1 = /4) */
+#define PLL_MUL    12u                       /* overclock search: x12 -> 144 MHz (200% of rated) */
+#define SYSCLK_HZ  (HSE_HZ * PLL_MUL)       /* 144 MHz */
+#define APB1_HZ    (SYSCLK_HZ / 4u)         /* 36 MHz (PPRE1 = /4) */
 
 static void clock_init(void) {
   RCC_CR |= (1u << 16);                        /* HSEON */
@@ -294,9 +294,9 @@ static unsigned g_wr;                    /* write cursor (in samples) */
    OPNA rate: at 96 MHz, I2SDIV=27, ODD=0 -> 96e6/(32*54) = 55556 Hz, i.e.
    PFM_MIX_RATE + 0.16% (~3 cents, inaudible). So the codec consumes exactly
    what the emulator produces, 1:1. */
-#define I2S_I2SDIV 37u
-#define I2S_ODD    0u   /* 2*37+0 = 74 -> 132e6/(32*74) = 55743 Hz (~OPNA rate, +0.5%) */
-#define I2S_FS (SYSCLK_HZ / (32u * (2u * I2S_I2SDIV + I2S_ODD))) /* 55743 Hz */
+#define I2S_I2SDIV 40u
+#define I2S_ODD    1u   /* 2*40+1 = 81 -> 144e6/(32*81) = 55555.6 Hz (= OPNA rate, exact) */
+#define I2S_FS (SYSCLK_HZ / (32u * (2u * I2S_I2SDIV + I2S_ODD))) /* 55556 Hz */
 
 static void i2c_codec_write(const uint8_t *cr, int n) {
   volatile uint32_t t;
@@ -313,6 +313,31 @@ static void i2c_codec_write(const uint8_t *cr, int n) {
   }
   t = 200000; while (!(I2C2_SR1 & (1u << 2)) && --t) {} /* BTF */
   I2C2_CR1 |= (1u << 9);                              /* STOP */
+}
+
+/* Write a single codec register (sub-address = reg). */
+static void i2c_codec_write_reg(uint8_t reg, uint8_t val) {
+  volatile uint32_t t;
+  I2C2_CR1 |= (1u << 8);
+  t = 200000; while (!(I2C2_SR1 & (1u << 0)) && --t) {}
+  I2C2_DR = 0xE2;
+  t = 200000; while (!(I2C2_SR1 & (1u << 1)) && --t) {}
+  (void)I2C2_SR2;
+  I2C2_DR = reg;
+  t = 200000; while (!(I2C2_SR1 & (1u << 7)) && --t) {}
+  I2C2_DR = val;
+  t = 200000; while (!(I2C2_SR1 & (1u << 7)) && --t) {}
+  t = 200000; while (!(I2C2_SR1 & (1u << 2)) && --t) {}
+  I2C2_CR1 |= (1u << 9);
+}
+
+/* Volume 0..BOARD_VOL_MAX -> STW5094A headphone gain (CR8/CR9). */
+void board_audio_set_volume(int level) {
+  if (level < 0) level = 0;
+  if (level > BOARD_VOL_MAX) level = BOARD_VOL_MAX;
+  uint8_t g = (uint8_t)(level * 3); /* 0..30, ~0x14 at the mid default */
+  i2c_codec_write_reg(8, g);
+  i2c_codec_write_reg(9, g);
 }
 
 static void codec_init(void) {

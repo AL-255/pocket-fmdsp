@@ -30,6 +30,10 @@ SECTIONS
   .ARM : { __exidx_start = .; *(.ARM.exidx*) __exidx_end = .; } >FLASH
   _sidata = LOADADDR(.data);
   .data : { . = ALIGN(4); _sdata = .; *(.data) *(.data*) . = ALIGN(4); _edata = .; } >RAM AT> FLASH
+  /* sim has no PFM_HOT functions, but startup.c copies .ramfunc unconditionally;
+     define an (empty) section so the symbols resolve and the copy is a no-op. */
+  .ramfunc : { . = ALIGN(4); _sramfunc = .; *(.ramfunc) *(.ramfunc*) . = ALIGN(4); _eramfunc = .; } >RAM AT> FLASH
+  _siramfunc = LOADADDR(.ramfunc);
   .bss :
   {
     . = ALIGN(4); _sbss = .; __bss_start__ = _sbss;

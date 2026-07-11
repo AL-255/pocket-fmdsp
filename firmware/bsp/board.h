@@ -47,6 +47,8 @@ uint32_t board_cycles(void);
 uint32_t board_cpu_hz(void);
 
 /* ---- audio out (interleaved stereo int16) ---- */
+#define BOARD_VOL_MAX 10
+void board_audio_set_volume(int level); /* 0..BOARD_VOL_MAX; codec HP gain */
 void board_audio_open(unsigned samplerate, uint32_t total_frames);
 void board_audio_write(const int16_t *stereo, size_t frames);
 void board_audio_close(void);

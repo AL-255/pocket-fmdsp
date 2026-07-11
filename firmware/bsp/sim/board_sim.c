@@ -113,6 +113,8 @@ static int g_wav_fd = -1, g_wav_no;
 static void put32(uint8_t *p, uint32_t v) { p[0]=v; p[1]=v>>8; p[2]=v>>16; p[3]=v>>24; }
 static void put16(uint8_t *p, uint16_t v) { p[0]=v; p[1]=v>>8; }
 
+void board_audio_set_volume(int level) { (void)level; }
+
 void board_audio_open(unsigned rate, uint32_t total_frames) {
   char path[] = "sim_play_000.wav";
   num3(path + 9, g_wav_no++);

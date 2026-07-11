@@ -36,6 +36,7 @@
 
 static uint8_t g_songbuf[22 * 1024]; /* >= SONG_MAX_LEN (21071); rest freed for .ramfunc */
 static int16_t g_chunk[512 * 2];
+static int g_volume = 5;             /* 0..BOARD_VOL_MAX, persists across songs */
 
 static void u2a(char *d, unsigned v, int width) { /* right-aligned decimal */
   char t[8];
@@ -110,7 +111,20 @@ static void draw_cpu_bar(const uint32_t *snap, uint64_t budget) {
   if (over) board_lcd_fill_rect(W - 2, 0, 2, BAR_H, COL_ERR);
 }
 
-static void play(int sel) {
+static void draw_vol(int vol) {
+  int y = H - 22;
+  board_lcd_fill_rect(2, y, W - 4, GFX_CH + 1, COL_BG);
+  char b[4];
+  u2a(b, vol, 2);
+  int x = gfx_text(2, y, "VOL ", COL_NUM, COL_BG);
+  gfx_text(x, y, b, COL_ACCENT, COL_BG);
+  int bw = W - 44, fw = vol * bw / BOARD_VOL_MAX;
+  board_lcd_fill_rect(40, y + 1, bw, 5, COL_SUB_BG);
+  board_lcd_fill_rect(40, y + 1, fw, 5, COL_BAR);
+}
+
+/* Returns 0 = back to menu, -1 = previous song, +1 = next song. */
+static int play(int sel) {
   board_lcd_clear(COL_BG);
   gfx_text(2, BAR_H + 4, UI_NOWPLAYING, COL_TITLE_FG, COL_BG);
   const char *grp = board_storage_group(sel);
@@ -121,18 +135,19 @@ static void play(int sel) {
   if (len <= 0) {
     gfx_text(2, 80, "load error", COL_ERR, COL_BG);
     board_lcd_present();
-    return;
+    return 0;
   }
   pfm_player *p = pfm_player_instance();
   pfm_player_init(p);
   if (!pfm_player_load(p, g_songbuf, (size_t)len)) {
     gfx_text(2, 80, "not a PMD file", COL_ERR, COL_BG);
     board_lcd_present();
-    return;
+    return 0;
   }
 
   unsigned rate = PFM_MIX_RATE;
   board_audio_open(rate, 0);
+  board_audio_set_volume(g_volume);
 
   /* static legend (colour swatch + task name) */
   int ly = BAR_H + 60;
@@ -141,13 +156,15 @@ static void play(int sel) {
     board_lcd_fill_rect(2, yy, 9, 9, task_col[t]);
     gfx_text(14, yy + 1, task_lbl[t], COL_FG, COL_BG);
   }
-  gfx_text(2, H - 10, "any key = stop", COL_NUM, COL_BG);
+  draw_vol(g_volume);
+  gfx_text(2, H - 10, "U/D vol  L/R song  C back", COL_NUM, COL_BG);
   board_lcd_present();
 
   for (int t = 0; t < PFM_PROF_N; t++) pfm_prof_cyc[t] = 0;
   uint32_t cpu_hz = board_cpu_hz();
   uint64_t win_frames = 0;
-  int refresh = 0, armed = 0;
+  int refresh = 0, ret = 0;
+  int prevb = board_input_poll(); /* current held buttons (e.g. the start-press) */
 #ifdef PFM_SIM
   uint32_t cap = rate * PLAY_SECONDS, done = 0; /* bounded render for the WAV harness */
 #endif
@@ -162,8 +179,20 @@ static void play(int sel) {
     if (done >= cap) break;
 #else
     int b = board_input_poll();
-    if (!armed) { if (!b) armed = 1; }  /* wait for the start-press to lift */
-    else if (b) break;                  /* any press -> back to menu */
+    int edge = b & ~prevb; /* new presses only */
+    prevb = b;
+    if (edge & BTN_CENTER) { ret = 0; break; }
+    else if (edge & BTN_LEFT) { ret = -1; break; }
+    else if (edge & BTN_RIGHT) { ret = 1; break; }
+    else if (edge & BTN_UP) {
+      if (g_volume < BOARD_VOL_MAX) g_volume++;
+      board_audio_set_volume(g_volume);
+      draw_vol(g_volume);
+    } else if (edge & BTN_DOWN) {
+      if (g_volume > 0) g_volume--;
+      board_audio_set_volume(g_volume);
+      draw_vol(g_volume);
+    }
 #endif
 
     if (++refresh >= 8) {
@@ -200,6 +229,7 @@ static void play(int sel) {
     }
   }
   board_audio_close();
+  return ret;
 }
 
 void ui_run(void) {
@@ -222,7 +252,15 @@ void ui_run(void) {
     else if (ev == BTN_RIGHT) { sel += VISROWS; if (sel > n - 1) sel = n - 1; }
     else if (ev == BTN_LEFT) { sel -= VISROWS; if (sel < 0) sel = 0; }
     else if (ev == BTN_CENTER) {
-      play(sel);
+      int r = play(sel);
+      while (r != 0) {           /* L/R in playback -> prev/next song, keep playing */
+        sel += r;
+        if (sel < 0) sel = n - 1;
+        else if (sel >= n) sel = 0;
+        if (sel < top) top = sel;
+        if (sel >= top + VISROWS) top = sel - VISROWS + 1;
+        r = play(sel);
+      }
       draw_list(sel, top, n);
       board_lcd_present();
       continue;
