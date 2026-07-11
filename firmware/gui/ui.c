@@ -233,8 +233,9 @@ static int sd_load_file(const char *name) {
   FIL fp;
   if (f_open(&fp, full, FA_READ) != FR_OK) return -1;
   UINT br = 0;
-  f_read(&fp, g_songbuf, sizeof(g_songbuf), &br);
+  FRESULT fr = f_read(&fp, g_songbuf, sizeof(g_songbuf), &br);
   f_close(&fp);
+  if (fr != FR_OK) return -1;   /* disk error after 10 retries -> hard fail */
   return (int)br;
 }
 
@@ -372,28 +373,38 @@ static void apply_mute(pfm_player *p) {
 static int start_song(pfm_player *p, int idx) {
   char name[BR_NAMELEN]; int isd;
   if (src_entry(idx, name, &isd) != 0 || isd) return 0;
-  int len = src_load_idx(idx);
-  if (len <= 0) return 0;
-  board_audio_mute(1);
-  g_muted_swap = 1;
+  strncpy(g_cur_name, name, sizeof(g_cur_name) - 1);
+  g_cur_name[sizeof(g_cur_name) - 1] = 0;
+  /* Silence the current song before we overwrite its buffer, so the (blocking)
+     SD read plays out muted rather than glitching. */
+  if (g_song_loaded) { board_audio_mute(1); g_muted_swap = 1; }
+  int len = src_load_idx(idx);                 /* SD read: 10x per-block retry + CRC */
+  if (len <= 0) goto fail;                      /* card read failed */
   pfm_player_init(p);
-  if (!pfm_player_load(p, g_songbuf, (size_t)len)) {
-    board_audio_mute(0); g_muted_swap = 0;
-    return 0;
-  }
+  if (!pfm_player_load(p, g_songbuf, (size_t)len)) goto fail; /* not a valid PMD */
   apply_mute(p);
   const char *t = pfm_player_get_title(p);
   strncpy(g_cur_title, (t && t[0]) ? t : name, sizeof(g_cur_title) - 1);
   g_cur_title[sizeof(g_cur_title) - 1] = 0;
-  strncpy(g_cur_name, name, sizeof(g_cur_name) - 1);
-  g_cur_name[sizeof(g_cur_name) - 1] = 0;
   strcpy(g_play_path, g_path);
   g_play_idx = idx;
-  if (!g_song_loaded) { board_audio_open(PFM_MIX_RATE, 0); board_audio_set_volume(g_volume); }
+  if (!g_song_loaded) {                          /* first song: bring the codec up */
+    board_audio_open(PFM_MIX_RATE, 0);
+    board_audio_set_volume(g_volume);
+    board_audio_mute(1); g_muted_swap = 1;       /* mute the codec power-up transient */
+  }
   g_render_frames = 0;
-  g_unmute_cons = board_audio_consumed_frames() + 1024; /* ~one ring drained */
+  g_unmute_cons = board_audio_consumed_frames() + 1024; /* unmute once old tail drains */
   g_song_loaded = 1;
   return 1;
+fail:
+  /* Read/parse failed; g_songbuf is now clobbered so the old song is gone. Stop
+     rendering (don't feed the codec a reset, empty player = silence at 0% CPU). */
+  g_song_loaded = 0;
+  board_audio_mute(0); g_muted_swap = 0;
+  strncpy(g_cur_title, "read error", sizeof(g_cur_title) - 1);
+  g_cur_title[sizeof(g_cur_title) - 1] = 0;
+  return 0;
 }
 /* prev/next within the *playing* song's directory (independent of browsing). */
 static void play_step(pfm_player *p, int dir) {
@@ -424,7 +435,7 @@ static void page_center(pfm_player *p) {
     char name[BR_NAMELEN]; int isd;
     if (src_entry(b_sel, name, &isd) != 0) return;
     if (isd) { path_push(name); browse_reload(); LCD_LOCK(); draw_browser_full(); LCD_UNLOCK(); }
-    else if (start_song(p, b_sel)) { g_page = PG_PLAY; LCD_LOCK(); draw_play_chrome(); LCD_UNLOCK(); }
+    else { start_song(p, b_sel); g_page = PG_PLAY; LCD_LOCK(); draw_play_chrome(); LCD_UNLOCK(); }
   } else if (g_page == PG_PLAY) {
     toggle_lcd();
   } else {                              /* settings: toggle selected item */

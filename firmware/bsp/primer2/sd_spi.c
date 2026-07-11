@@ -52,6 +52,18 @@ static uint8_t xchg(uint8_t out) {
   return in;
 }
 
+/* CRC-16/CCITT (poly 0x1021, init 0) — the card always sends a valid data CRC in
+   SPI mode, so checking it catches bit errors from the fast bit-bang clock. */
+static uint16_t crc16_ccitt(const uint8_t *p, int n) {
+  uint16_t crc = 0;
+  for (int i = 0; i < n; i++) {
+    crc ^= (uint16_t)p[i] << 8;
+    for (int b = 0; b < 8; b++)
+      crc = (crc & 0x8000u) ? (uint16_t)((crc << 1) ^ 0x1021u) : (uint16_t)(crc << 1);
+  }
+  return crc;
+}
+
 static void gpio_setup(void) {
   REG32(0x40021018) |= (1u << 4) | (1u << 5); /* RCC_APB2ENR: IOPC, IOPD */
   /* PC8 MISO: input pull-up (CNF=10, MODE=00). PC11/PC12: output PP 50MHz (0x3). */
@@ -124,30 +136,45 @@ int sd_init(void) {
 
   CS_HI();
   xchg(0xFF);
-  g_clk_delay = 0;                   /* fast clock for data */
+  g_clk_delay = 2;                   /* small MISO settle delay for reliable data */
   return 0;
 }
 
 int sd_status(void) { return sd_type ? 0 : -1; }
 
-/* Read `count` 512-byte blocks starting at LBA `lba` into buf. */
-int sd_read_blocks(uint32_t lba, uint8_t *buf, unsigned count) {
-  if (!sd_type) return -1;
-  uint32_t arg = (sd_type == 2) ? lba : lba * 512u;
+/* Read one 512-byte block (CMD17) into buf, validating the data CRC. Returns 0 on
+   success. Leaves CS high. */
+static int read_one_block(uint32_t arg, uint8_t *buf) {
   CS_LO();
-  for (unsigned blk = 0; blk < count; blk++) {
-    uint8_t r = send_cmd(17, arg + (sd_type == 2 ? blk : blk * 512u), 0xFF);
-    if (r != 0x00) { CS_HI(); return -2; }
-    /* wait for the data token 0xFE */
-    int tries = 40000;
-    uint8_t tok;
-    do { tok = xchg(0xFF); } while (tok == 0xFF && --tries);
-    if (tok != 0xFE) { CS_HI(); return -3; }
-    for (int i = 0; i < 512; i++) buf[i] = xchg(0xFF);
-    xchg(0xFF); xchg(0xFF); /* discard CRC */
-    buf += 512;
-  }
+  uint8_t r = send_cmd(17, arg, 0xFF);
+  if (r != 0x00) { CS_HI(); xchg(0xFF); return -2; }
+  int tries = 40000;
+  uint8_t tok;
+  do { tok = xchg(0xFF); } while (tok == 0xFF && --tries); /* wait data token */
+  if (tok != 0xFE) { CS_HI(); xchg(0xFF); return -3; }
+  for (int i = 0; i < 512; i++) buf[i] = xchg(0xFF);
+  uint8_t c0 = xchg(0xFF), c1 = xchg(0xFF);
   CS_HI();
   xchg(0xFF);
+  if ((uint16_t)((c0 << 8) | c1) != crc16_ccitt(buf, 512)) return -4; /* bad CRC */
+  return 0;
+}
+
+/* Read `count` 512-byte blocks starting at LBA `lba` into buf. Each block is
+   retried up to 10 times on any command/token/CRC failure before giving up. */
+#define SD_READ_RETRIES 10
+int sd_read_blocks(uint32_t lba, uint8_t *buf, unsigned count) {
+  if (!sd_type) return -1;
+  uint32_t base = (sd_type == 2) ? lba : lba * 512u;
+  for (unsigned blk = 0; blk < count; blk++) {
+    uint32_t arg = base + (sd_type == 2 ? blk : blk * 512u);
+    int rc = -1;
+    for (int attempt = 0; attempt < SD_READ_RETRIES; attempt++) {
+      rc = read_one_block(arg, buf);
+      if (rc == 0) break;
+    }
+    if (rc != 0) return rc;   /* still failing after 10 tries */
+    buf += 512;
+  }
   return 0;
 }
