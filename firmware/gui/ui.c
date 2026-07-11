@@ -35,8 +35,7 @@
 #define COL_BAR       rgb565(120, 230, 160)
 
 static uint8_t g_songbuf[22 * 1024]; /* >= SONG_MAX_LEN (21071); rest freed for .ramfunc */
-#define RENDER_CHUNK 256             /* frames per render call (smaller => more RAM for ring) */
-static int16_t g_chunk[RENDER_CHUNK * 2];
+static int16_t g_chunk[512 * 2];
 static int g_volume = 5;             /* 0..BOARD_VOL_MAX, persists across songs */
 static int g_lcd_on = 1;             /* tap C toggles LCD drawing during playback */
 
@@ -46,13 +45,10 @@ static int g_lcd_on = 1;             /* tap C toggles LCD drawing during playbac
 #include "semphr.h"
 static SemaphoreHandle_t g_lcd_mtx;
 static StaticSemaphore_t g_lcd_mtx_buf;
-static volatile int g_song_loaded;      /* 1 while a song is loaded */
+static volatile int g_song_loaded;      /* 1 while a song is loaded and rendering */
 static volatile uint32_t g_render_frames; /* cumulative frames produced */
-static TaskHandle_t g_audio_task;       /* the dedicated OPNA/render task */
-static volatile int g_audio_run;        /* 1 = OPNA task renders; 0 = it self-suspends */
-/* Render up to this fill, leaving room for one chunk so board_audio_write never
-   busy-waits. Full ring = BOARD_AUD_RING; keep a chunk of headroom. */
-#define AUD_HIGH_WATER (BOARD_AUD_RING - RENDER_CHUNK)
+#define AUD_HIGH_WATER 512 /* frames: yield to LCD above this; a 512-render always
+                              fits the 1024 ring below it, so writes never spin */
 #define LCD_LOCK()   xSemaphoreTake(g_lcd_mtx, portMAX_DELAY)
 #define LCD_UNLOCK() xSemaphoreGive(g_lcd_mtx)
 void ui_init(void) { g_lcd_mtx = xSemaphoreCreateMutexStatic(&g_lcd_mtx_buf); }
@@ -177,9 +173,6 @@ static char g_cur_name[48];
 static uint32_t g_unmute_cons;   /* consumed-frame count at which to lift the swap mute */
 static int g_muted_swap;         /* codec muted across a song swap */
 static int g_dbg_len;            /* last load: bytes read (>0) or negative error */
-static uint32_t g_load_ms;       /* last song load wall time (ms) */
-static uint32_t g_load_kbps;     /* last song load throughput (KB/s approx) */
-#define DWT_CYCCNT (*(volatile uint32_t *)0xE0001004u)
 
 /* --- browser (SD only) --- */
 static FATFS g_fatfs;
@@ -306,17 +299,15 @@ static int dbg_app(char *d, int o, const char *lab, int v) {
 }
 static void draw_dbg(void) {
   char s[48]; int o = 0;
-  /* SD perf: L=load bytes, t=load ms, K=KB/s, E=read errors */
   o = dbg_app(s, o, "L", g_dbg_len);
-  o = dbg_app(s, o, "t", (int)g_load_ms);
-  o = dbg_app(s, o, "K", (int)g_load_kbps);
+  o = dbg_app(s, o, "fill", board_audio_ring_fill());
   o = dbg_app(s, o, "E", (int)board_sd_read_errors());
   board_lcd_fill_rect(2, PLAY_DBG_Y, W - 4, GFX_CH, COL_BG);
   gfx_text(2, PLAY_DBG_Y, s, COL_NUM, COL_BG);
   o = 0;
-  o = dbg_app(s, o, "f", board_audio_ring_fill());
   o = dbg_app(s, o, "sd", g_have_sd);
   o = dbg_app(s, o, "rc", g_mount_rc);
+  o = dbg_app(s, o, "ld", g_song_loaded);
   o = dbg_app(s, o, "m", g_muted_swap);
   board_lcd_fill_rect(2, PLAY_DBG_Y + 11, W - 4, GFX_CH, COL_BG);
   gfx_text(2, PLAY_DBG_Y + 11, s, COL_NUM, COL_BG);
@@ -415,67 +406,32 @@ static void draw_settings_full(void) {
 static void apply_mute(pfm_player *p) {
   pfm_player_set_mute(p, g_mute[0], g_mute[1], g_mute[2], g_mute[3]);
 }
-static void audio_suspend(void) {           /* "kill" the OPNA task */
-  g_audio_run = 0;
-  if (g_audio_task) vTaskSuspend(g_audio_task);
-}
-static void audio_resume(void) {            /* "restart" the OPNA task */
-  g_audio_run = 1;
-  if (g_audio_task) vTaskResume(g_audio_task);
-}
-/* Render the new song straight into the ring until it is full, before the OPNA
-   task takes over — so playback starts with a completely primed buffer. */
-static void prefill_ring(pfm_player *p) {
-  int guard = BOARD_AUD_RING / RENDER_CHUNK + 2;
-  while (board_audio_ring_fill() < (int)AUD_HIGH_WATER && guard-- > 0) {
-    pfm_player_render(p, g_chunk, RENDER_CHUNK);
-    board_audio_write(g_chunk, RENDER_CHUNK);
-    g_render_frames += RENDER_CHUNK;
-  }
-}
-/* Switch songs by fully cycling the pipeline: stop the OPNA task, load the
-   buffer from SD (safe now nothing renders), reset player + audio, pre-fill the
-   ring, then restart the OPNA task. Nothing from the old song survives. Retries
-   the whole load a few times to ride out an occasional bad block. */
+/* Load file entry `idx` of the current browse dir and make it the playing song.
+   Mutes the codec across the swap; the super-loop lifts the mute once the old
+   ring tail has drained, so there is no transition pop. Returns 1 on success. */
 static int start_song(pfm_player *p, int idx) {
   char name[BR_NAMELEN]; int isd;
   if (src_entry(idx, name, &isd) != 0 || isd) return 0;
   strncpy(g_cur_name, name, sizeof(g_cur_name) - 1);
   g_cur_name[sizeof(g_cur_name) - 1] = 0;
-
-  int was_loaded = g_song_loaded;
-  audio_suspend();                 /* 1. kill the OPNA task */
-  board_audio_mute(1);
-  g_muted_swap = 1;
-
-  int len = 0, ok = 0;             /* 2. load the buffer (blocking SD, no render racing) */
-  uint32_t t0 = DWT_CYCCNT;
-  for (int attempt = 0; attempt < 3 && !ok; attempt++) {
-    len = src_load_idx(idx);
-    g_dbg_len = len;
-    if (len <= 0) continue;
-    pfm_player_init(p);
-    if (pfm_player_load(p, g_songbuf, (size_t)len)) ok = 1;
-    else g_dbg_len = -99;
-  }
-  uint32_t khz = board_cpu_hz() / 1000u;
-  g_load_ms = (DWT_CYCCNT - t0) / (khz ? khz : 1u);
-  g_load_kbps = (g_load_ms && len > 0) ? ((uint32_t)len * 1000u) / (g_load_ms * 1024u) : 0;
-  if (!ok) {                       /* give up: stop cleanly, don't render garbage */
-    g_song_loaded = 0;
-    board_audio_mute(0); g_muted_swap = 0;
-    strncpy(g_cur_title, "read error", sizeof(g_cur_title) - 1);
-    g_cur_title[sizeof(g_cur_title) - 1] = 0;
-    return 0;
-  }
-
-  apply_mute(p);                   /* 3. fresh state */
+  /* Silence the current song before we overwrite its buffer, so the (blocking)
+     SD read plays out muted rather than glitching. */
+  if (g_song_loaded) { board_audio_mute(1); g_muted_swap = 1; }
+  int len = src_load_idx(idx);                 /* SD read: 10x per-block retry + CRC */
+  g_dbg_len = len;
+  if (len <= 0) goto fail;                      /* card read failed */
+  pfm_player_init(p);
+  if (!pfm_player_load(p, g_songbuf, (size_t)len)) { g_dbg_len = -99; goto fail; } /* not PMD */
+  apply_mute(p);
   const char *t = pfm_player_get_title(p);
   strncpy(g_cur_title, (t && t[0]) ? t : name, sizeof(g_cur_title) - 1);
   g_cur_title[sizeof(g_cur_title) - 1] = 0;
   strcpy(g_play_path, g_path);
   g_play_idx = idx;
-  if (!was_loaded) {
+  /* Reset the ENTIRE audio pipeline on every song so nothing carries over between
+     tracks: first song opens the codec; a switch re-primes the ring/DMA/counters
+     (clears the drift the blocking SD read introduces). */
+  if (!g_song_loaded) {
     board_audio_open(PFM_MIX_RATE, 0);
     board_audio_set_volume(g_volume);
     board_audio_set_output(g_out_speaker);
@@ -483,15 +439,19 @@ static int start_song(pfm_player *p, int idx) {
   } else {
     board_audio_restart();
   }
+  g_muted_swap = 1;
   g_render_frames = 0;
-  prefill_ring(p);                 /* 4. prime the ring with the new song */
-  /* Ring is already full of the NEW song (clean restart cleared any old tail), so
-     the mute only needs to cover the I2S restart transient — a short window, not
-     a whole ring, or we'd clip the start of every track. */
-  g_unmute_cons = board_audio_consumed_frames() + 512;
+  g_unmute_cons = board_audio_consumed_frames() + 1024; /* unmute once old tail drains */
   g_song_loaded = 1;
-  audio_resume();                  /* 5. restart the OPNA task */
   return 1;
+fail:
+  /* Read/parse failed; g_songbuf is now clobbered so the old song is gone. Stop
+     rendering (don't feed the codec a reset, empty player = silence at 0% CPU). */
+  g_song_loaded = 0;
+  board_audio_mute(0); g_muted_swap = 0;
+  strncpy(g_cur_title, "read error", sizeof(g_cur_title) - 1);
+  g_cur_title[sizeof(g_cur_title) - 1] = 0;
+  return 0;
 }
 /* prev/next within the *playing* song's directory (independent of browsing). */
 static void play_step(pfm_player *p, int dir) {
@@ -570,28 +530,6 @@ static void page_nav(pfm_player *p, int edge) {
   }
 }
 
-/* Dedicated highest-priority OPNA/render task: nothing but synth -> ring. It is
-   suspended around a song switch (see start_song) so the SD load can't race it,
-   and it lifts the swap-mute once the fresh song has drained one ring. */
-void ui_set_audio_handle(void *h) { g_audio_task = (TaskHandle_t)h; }
-void ui_audio_task(void) {
-  pfm_player *p = pfm_player_instance();
-  for (;;) {
-    if (!g_audio_run) { vTaskSuspend(NULL); continue; }
-    if (g_song_loaded && board_audio_ring_fill() < (int)AUD_HIGH_WATER) {
-      pfm_player_render(p, g_chunk, RENDER_CHUNK);
-      board_audio_write(g_chunk, RENDER_CHUNK);
-      g_render_frames += RENDER_CHUNK;
-      if (g_muted_swap && board_audio_consumed_frames() >= g_unmute_cons) {
-        board_audio_mute(0);
-        g_muted_swap = 0;
-      }
-    } else {
-      vTaskDelay(1);   /* ring full (or idle): let the UI + meter tasks run */
-    }
-  }
-}
-
 /* lowest-priority meter task: paints only on the Playback page */
 void ui_lcd_task(void) {
   uint32_t last_frames = 0, last_drops = 0, last_cons = 0;
@@ -636,13 +574,20 @@ void ui_run(void) {
   g_page = PG_BROWSER;
   LCD_LOCK(); draw_browser_full(); LCD_UNLOCK();
 
-  /* UI task: input + pages only. Rendering lives in the OPNA task (higher prio),
-     which preempts this whenever it has room to fill, so audio is never starved
-     by input handling or a page redraw. */
   int prevb = board_input_poll();
-  TickType_t c_press = 0, last_nav = 0;
+  TickType_t c_press = 0, last_nav = 0, last_yield = 0;
   int c_armed = !(prevb & BTN_CENTER), c_done = 0;
   for (;;) {
+    int rendered = 0;
+    if (g_song_loaded && board_audio_ring_fill() < (int)AUD_HIGH_WATER) {
+      pfm_player_render(p, g_chunk, 512);
+      board_audio_write(g_chunk, 512);
+      g_render_frames += 512;
+      rendered = 1;
+    }
+    if (g_muted_swap && board_audio_consumed_frames() >= g_unmute_cons) {
+      board_audio_mute(0); g_muted_swap = 0;
+    }
     int b = board_input_poll();
     int edge = b & ~prevb;
     TickType_t now = xTaskGetTickCount();
@@ -661,7 +606,13 @@ void ui_run(void) {
       last_nav = now;
     }
     prevb = b;
-    vTaskDelay(pdMS_TO_TICKS(8));   /* ~125 Hz input poll; audio task runs between */
+    /* Yield when idle, and force a slot at least every ~33 ms even when rendering
+       flat-out, so the lowest-priority meter task can't be starved (a 1-tick nap
+       drains ~55 frames; the ring has far more, so audio is unaffected). */
+    if (!rendered || (now - last_yield) >= pdMS_TO_TICKS(33)) {
+      vTaskDelay(1);
+      last_yield = now;
+    }
   }
 }
 

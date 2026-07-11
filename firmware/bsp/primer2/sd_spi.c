@@ -61,42 +61,6 @@ SD_HOT static uint8_t xchg(uint8_t out) {
   return in;
 }
 
-/* MISO settle after the SCK rising edge. The known-good C read used g_clk_delay=2
-   (~14 cycles) here; 2 nops was too short and gave marginal reads that corrupted
-   multi-block song loads (single-sector dir reads tolerated it). Match the proven
-   timing. Tune down later once reliability is confirmed via the throughput/error
-   counters. */
-#define SD_RD_SETTLE ".rept 14\n   nop\n   .endr\n"
-
-/* Fast data-read: clock in `n` bytes with MOSI held high, MSB first, SPI mode 0.
-   Hand-written Thumb-2, 8x unrolled, addresses/masks hoisted into registers, run
-   from SRAM (.ramfunc). This is the block-read hot path (the C xchg is only used
-   for the few command bytes). GPIOC: SCK=PC12, MISO=PC8. */
-SD_HOT static void sd_read_data(uint8_t *buf, unsigned n) {
-  if (!n) return;
-  MOSI_HI();                                  /* send 0xFF throughout the read */
-  volatile uint32_t *bsrr = &BSRR(GPIOC);
-  volatile uint32_t *idr = &IDR(GPIOC);
-  uint32_t acc, tmp;
-  __asm__ volatile(
-    "1:                                   \n"
-    "   movs   %[acc], #0                 \n"   /* in = 0 */
-    ".rept 8                              \n"
-    "   str    %[hi], [%[bsrr]]           \n"   /* SCK high (sample edge) */
-    "   " SD_RD_SETTLE "                  \n"   /* MISO settle */
-    "   ldr    %[tmp], [%[idr]]           \n"   /* read port */
-    "   str    %[lo], [%[bsrr]]           \n"   /* SCK low */
-    "   ubfx   %[tmp], %[tmp], #8, #1     \n"   /* isolate MISO (PC8) */
-    "   orr    %[acc], %[tmp], %[acc], lsl #1 \n" /* in = (in<<1) | miso */
-    ".endr                               \n"
-    "   strb   %[acc], [%[buf]], #1       \n"   /* *buf++ = in */
-    "   subs   %[n], %[n], #1             \n"
-    "   bne    1b                         \n"
-    : [buf] "+r"(buf), [n] "+r"(n), [acc] "=&r"(acc), [tmp] "=&r"(tmp)
-    : [bsrr] "r"(bsrr), [idr] "r"(idr), [hi] "r"(1u << 12), [lo] "r"(1u << 28)
-    : "memory", "cc");
-}
-
 
 static void gpio_setup(void) {
   REG32(0x40021018) |= (1u << 4) | (1u << 5); /* RCC_APB2ENR: IOPC, IOPD */
@@ -170,18 +134,49 @@ int sd_init(void) {
 
   CS_HI();
   xchg(0xFF);
-  g_clk_delay = 2;                   /* data phase: small settle for reliability
-                                        (SRAM already ~2x faster; reliability > raw
-                                        speed since a bad read fails the load) */
+  g_clk_delay = 2;                   /* command/token phase: small settle for reliability
+                                        (the 512-byte data read uses the asm path) */
   return 0;
 }
 
 int sd_status(void) { return sd_type ? 0 : -1; }
 
+/* MISO settle after the SCK rising edge (nops). Matches the proven C timing
+   (~g_clk_delay=2); tune down later using the throughput/error counters. */
+#define SD_RD_SETTLE ".rept 14\n   nop\n   .endr\n"
+
+/* Fast data-read: clock in `n` bytes with MOSI held high, MSB first, SPI mode 0.
+   Hand-written Thumb-2, 8x unrolled, GPIO addresses/masks hoisted into registers,
+   run from SRAM (.ramfunc). This is the block-read hot path (the C xchg handles
+   the few command bytes). GPIOC: SCK=PC12, MISO=PC8. */
+SD_HOT static void sd_read_data(uint8_t *buf, unsigned n) {
+  if (!n) return;
+  MOSI_HI();                                  /* send 0xFF throughout the read */
+  volatile uint32_t *bsrr = &BSRR(GPIOC);
+  volatile uint32_t *idr = &IDR(GPIOC);
+  uint32_t acc, tmp;
+  __asm__ volatile(
+    "1:                                   \n"
+    "   movs   %[acc], #0                 \n"   /* in = 0 */
+    ".rept 8                              \n"
+    "   str    %[hi], [%[bsrr]]           \n"   /* SCK high (sample edge) */
+    "   " SD_RD_SETTLE "                  \n"   /* MISO settle */
+    "   ldr    %[tmp], [%[idr]]           \n"   /* read port */
+    "   str    %[lo], [%[bsrr]]           \n"   /* SCK low */
+    "   ubfx   %[tmp], %[tmp], #8, #1     \n"   /* isolate MISO (PC8) */
+    "   orr    %[acc], %[tmp], %[acc], lsl #1 \n" /* in = (in<<1) | miso */
+    ".endr                               \n"
+    "   strb   %[acc], [%[buf]], #1       \n"   /* *buf++ = in */
+    "   subs   %[n], %[n], #1             \n"
+    "   bne    1b                         \n"
+    : [buf] "+r"(buf), [n] "+r"(n), [acc] "=&r"(acc), [tmp] "=&r"(tmp)
+    : [bsrr] "r"(bsrr), [idr] "r"(idr), [hi] "r"(1u << 12), [lo] "r"(1u << 28)
+    : "memory", "cc");
+}
+
 /* Read one 512-byte block (CMD17) into buf. The trailing 16-bit CRC is clocked
    out but not checked: in SPI mode the data CRC is unreliable across cards (the
-   reference ChaN/FatFs SPI driver skips it too), and checking it produced only
-   false failures on this card. Returns 0 on success; leaves CS high. */
+   reference ChaN/FatFs SPI driver skips it too). Returns 0 on success; CS high. */
 SD_HOT static int read_one_block(uint32_t arg, uint8_t *buf) {
   CS_LO();
   uint8_t r = send_cmd(17, arg, 0xFF);

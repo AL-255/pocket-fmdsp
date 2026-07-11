@@ -285,7 +285,7 @@ int board_input_wait(void) {
    Output is routed to the headphone jack only (CR6 bits 0x0c = PHL/PHR); the
    loudspeaker (bit 0x10) is off, as this board has no HP-detect line. */
 
-#define AUD_RING BOARD_AUD_RING          /* stereo frames in the DMA FIFO (~28 ms) */
+#define AUD_RING 1024                    /* stereo frames in the DMA FIFO (~18 ms) */
 static int16_t g_ring[AUD_RING * 2];     /* interleaved L,R @ I2S_FS */
 static unsigned g_wr;                    /* write cursor (in samples) */
 
@@ -442,7 +442,7 @@ void board_audio_open(unsigned rate, uint32_t total_frames) {
   (void)rate; (void)total_frames;
   for (unsigned i = 0; i < AUD_RING * 2; i++) g_ring[i] = 0;
   g_wr = 0;
-  g_written_s = 0;           /* empty: the caller pre-fills with real song data */
+  g_written_s = AUD_RING * 2; /* ring starts pre-filled with silence */
   g_consumed_s = 0;
   g_dropped_s = 0;
   g_last_rd = 0;
@@ -510,7 +510,7 @@ void board_audio_restart(void) {
   DMA2_CCR2 &= ~1u;                        /* DMA disable */
   for (unsigned i = 0; i < AUD_RING * 2; i++) g_ring[i] = 0;
   g_wr = 0;
-  g_written_s = 0;                         /* empty: caller pre-fills with song */
+  g_written_s = AUD_RING * 2;              /* pre-filled with silence */
   g_consumed_s = 0;
   g_dropped_s = 0;
   g_last_rd = 0;

@@ -262,13 +262,6 @@ struct driver_pmd {
   // data[-1] is valid (OPM flag)
   uint8_t *data;
   uint16_t datalen;
-  // pocket-fmdsp: stock PMD stores [ ]-loop counters inline in `data`. To keep
-  // the song buffer strictly READ-ONLY (so it can live in flash), those counter
-  // bytes are shadowed here in SRAM instead (keyed by their offset in `data`).
-#define PMD_LOOPCTR_MAX 256
-  uint16_t loopctr_off[PMD_LOOPCTR_MAX];
-  uint8_t  loopctr_val[PMD_LOOPCTR_MAX];
-  uint16_t loopctr_n;
   // 0ee1
   const struct pmd_ssgeff_data *ssgeff_ptr;
   // 0ee3
