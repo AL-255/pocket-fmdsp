@@ -341,6 +341,21 @@ void board_audio_set_volume(int level) {
   i2c_codec_write_reg(9, g);
 }
 
+/* CR6 routing: bit5 = MUT, 0x10 = loudspeaker, 0x0c = headphone, 0x02 = SE.
+   Kept in a shadow so mute and output-select compose without clobbering. */
+static uint8_t g_cr6 = 0x0c | 0x02;
+
+void board_audio_mute(int on) {
+  if (on) g_cr6 |= 0x20u;
+  else    g_cr6 &= ~0x20u;
+  i2c_codec_write_reg(6, g_cr6);
+}
+
+void board_audio_set_output(int speaker) {
+  g_cr6 = (uint8_t)((speaker ? 0x10u : 0x0cu) | 0x02u | (g_cr6 & 0x20u));
+  i2c_codec_write_reg(6, g_cr6);
+}
+
 static void codec_init(void) {
   RCC_APB2ENR |= (1u << 0);   /* AFIO */
   RCC_APB1ENR |= (1u << 22);  /* I2C2 */
@@ -357,7 +372,7 @@ static void codec_init(void) {
   cr[1] = 0x14;
   cr[4] = 0x6f;
   cr[5] = 0x17;
-  cr[6] = 0x0c | 0x02;        /* headphone (PHL/PHR) + SE, loudspeaker off, not muted */
+  cr[6] = g_cr6;              /* headphone (PHL/PHR) + SE, loudspeaker off, not muted */
   cr[7] = 0x04;               /* output gain */
   cr[8] = 0x14;               /* HP gain L */
   cr[9] = 0x14;               /* HP gain R */

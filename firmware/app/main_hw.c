@@ -10,7 +10,7 @@
 
 /* fully static allocation — no heap */
 static StaticTask_t s_app_tcb, s_lcd_tcb, s_idle_tcb;
-static StackType_t s_app_stack[768]; /* room for FatFs's deeper call chain */
+static StackType_t s_app_stack[1024]; /* FatFs FIL carries a 512B sector buffer */
 static StackType_t s_lcd_stack[256];
 static StackType_t s_idle_stack[configMINIMAL_STACK_SIZE];
 
@@ -34,7 +34,7 @@ static void lcd_task(void *arg) {
 int main(void) {
   board_init();
   ui_init();
-  xTaskCreateStatic(app_task, "app", 768, NULL, 2, s_app_stack, &s_app_tcb);
+  xTaskCreateStatic(app_task, "app", 1024, NULL, 2, s_app_stack, &s_app_tcb);
   xTaskCreateStatic(lcd_task, "lcd", 256, NULL, 1, s_lcd_stack, &s_lcd_tcb);
   vTaskStartScheduler();
   for (;;) {

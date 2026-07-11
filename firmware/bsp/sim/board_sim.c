@@ -114,6 +114,8 @@ static void put32(uint8_t *p, uint32_t v) { p[0]=v; p[1]=v>>8; p[2]=v>>16; p[3]=
 static void put16(uint8_t *p, uint16_t v) { p[0]=v; p[1]=v>>8; }
 
 void board_audio_set_volume(int level) { (void)level; }
+void board_audio_mute(int on) { (void)on; }
+void board_audio_set_output(int speaker) { (void)speaker; }
 uint32_t board_audio_underruns(void) { return 0; }
 uint32_t board_audio_consumed_frames(void) { return 0; }
 int32_t board_audio_ring_fill(void) { return 1 << 20; } /* sim: always draw */

@@ -45,9 +45,10 @@ static int g_lcd_on = 1;             /* tap C toggles LCD drawing during playbac
 #include "semphr.h"
 static SemaphoreHandle_t g_lcd_mtx;
 static StaticSemaphore_t g_lcd_mtx_buf;
-static volatile int g_playing;          /* 1 while a song is rendering */
+static volatile int g_song_loaded;      /* 1 while a song is loaded and rendering */
 static volatile uint32_t g_render_frames; /* cumulative frames produced */
-#define AUD_HIGH_WATER 768 /* frames: yield to LCD when the ring is this full */
+#define AUD_HIGH_WATER 512 /* frames: yield to LCD above this; a 512-render always
+                              fits the 1024 ring below it, so writes never spin */
 #define LCD_LOCK()   xSemaphoreTake(g_lcd_mtx, portMAX_DELAY)
 #define LCD_UNLOCK() xSemaphoreGive(g_lcd_mtx)
 void ui_init(void) { g_lcd_mtx = xSemaphoreCreateMutexStatic(&g_lcd_mtx_buf); }
@@ -68,7 +69,8 @@ static void u2a(char *d, unsigned v, int width) { /* right-aligned decimal */
   d[i] = 0;
 }
 
-static void draw_list(int sel, int top, int n) {
+__attribute__((unused))
+static void draw_list(int sel, int top, int n) {  /* sim browser only */
   board_lcd_clear(COL_BG);
 
   board_lcd_fill_rect(0, 0, W, TITLE_H, COL_TITLE_BG);
@@ -145,255 +147,57 @@ static void draw_vol(int vol) {
 
 #include <string.h>
 
-static char g_cur_title[80]; /* Shift-JIS title/name shown on the play screen */
+/* ============================================================================
+   Tab UI: three pages (Browser / Playback / Settings). Long-press Center cycles
+   pages; short Center is the page action. A single non-blocking super-loop keeps
+   the loaded song rendering no matter which page is shown, so switching tabs
+   never interrupts the music (audio is this task; the LCD task is lower prio).
+   The sim (no FreeRTOS) keeps a simple flat browser + fixed-length preview.
+   ============================================================================ */
 
-/* Static playback chrome: title + compact 2x3 legend + CPU/DR labels. */
-static void draw_play_chrome(void) {
-  board_lcd_clear(COL_BG);
-  gfx_text(2, BAR_H + 4, g_cur_title, COL_TITLE_FG, COL_BG);
-  int cy = BAR_H + 20;
-  gfx_text(2, cy, "CPU", COL_NUM, COL_BG);
-  gfx_text(30, cy, "%", COL_NUM, COL_BG);
-  gfx_text(40, cy, "DR", COL_NUM, COL_BG);
-  for (int t = 0; t < PFM_PROF_N; t++) {
-    int x = 2 + (t % 3) * 43;
-    int y = (BAR_H + 34) + (t / 3) * 12;
-    board_lcd_fill_rect(x, y, 7, 7, task_col[t]);
-    gfx_text(x + 9, y, task_lbl[t], COL_FG, COL_BG);
-  }
-  draw_vol(g_volume);
-  gfx_text(2, H - 10, "UD vol  LR song  Ctap lcd", COL_NUM, COL_BG);
-  board_lcd_present();
-}
+/* play-screen geometry (128x160, 4px half-width font) */
+#define PLAY_TITLE_Y (BAR_H + 2)
+#define PLAY_NAME_Y  (BAR_H + 12)
+#define PLAY_CPU_Y   (BAR_H + 23)
+#define PLAY_LEG_Y   (BAR_H + 35)
 
-static void toggle_lcd(void) {
-  g_lcd_on = !g_lcd_on;
-  LCD_LOCK();
-  if (g_lcd_on) draw_play_chrome();
-  else { board_lcd_clear(COL_BG); gfx_text(2, 40, "LCD off (tap C)", COL_NUM, COL_BG); board_lcd_present(); }
-  LCD_UNLOCK();
-}
-
-/* Play the already-loaded player singleton; `display` is the title to show.
-   Returns 0 = back to menu, -1 = previous song, +1 = next song. */
-static int play(const char *display) {
-  pfm_player *p = pfm_player_instance();
-  strncpy(g_cur_title, display, sizeof(g_cur_title) - 1);
-  g_cur_title[sizeof(g_cur_title) - 1] = 0;
-
-  unsigned rate = PFM_MIX_RATE;
-  board_audio_open(rate, 0);
-  board_audio_set_volume(g_volume);
-  for (int t = 0; t < PFM_PROF_N; t++) pfm_prof_cyc[t] = 0;
-
-  int ret = 0;
-  int prevb = board_input_poll();
-  int c_armed = !(prevb & BTN_CENTER);
-
-#ifdef PFM_RTOS
-  g_render_frames = 0;
-  LCD_LOCK();
-  if (g_lcd_on) draw_play_chrome();
-  else { board_lcd_clear(COL_BG); gfx_text(2, 40, "LCD off (tap C)", COL_NUM, COL_BG); board_lcd_present(); }
-  LCD_UNLOCK();
-  g_playing = 1;
-  TickType_t c_press = 0;
-#else
-  LCD_LOCK(); draw_play_chrome(); LCD_UNLOCK();
-  int refresh = 0, c_held = 0;
-  uint64_t win_frames = 0;
-  uint32_t cpu_hz = board_cpu_hz(), last_drops = 0, last_cons = 0;
-  uint32_t cap = rate * PLAY_SECONDS, done = 0;
-#endif
-
-  for (;;) {
-#ifdef PFM_RTOS
-    if (board_audio_ring_fill() >= (int)AUD_HIGH_WATER) {
-      vTaskDelay(1);
-    } else {
-      pfm_player_render(p, g_chunk, 512);
-      board_audio_write(g_chunk, 512);
-      g_render_frames += 512;
-    }
-#else
-    pfm_player_render(p, g_chunk, 512);
-    board_audio_write(g_chunk, 512);
-    win_frames += 512;
-    done += 512;
-    if (done >= cap) break;
-#endif
-    int b = board_input_poll();
-    int edge = b & ~prevb;
-    if (edge & BTN_LEFT) { ret = -1; break; }
-    else if (edge & BTN_RIGHT) { ret = 1; break; }
-    else if (edge & BTN_UP) {
-      if (g_volume < BOARD_VOL_MAX) g_volume++;
-      board_audio_set_volume(g_volume);
-      if (g_lcd_on) { LCD_LOCK(); draw_vol(g_volume); LCD_UNLOCK(); }
-    } else if (edge & BTN_DOWN) {
-      if (g_volume > 0) g_volume--;
-      board_audio_set_volume(g_volume);
-      if (g_lcd_on) { LCD_LOCK(); draw_vol(g_volume); LCD_UNLOCK(); }
-    }
-#ifdef PFM_RTOS
-    if (b & BTN_CENTER) {
-      if (c_armed) {
-        if (!c_press) c_press = xTaskGetTickCount();
-        else if ((xTaskGetTickCount() - c_press) >= pdMS_TO_TICKS(400)) { ret = 0; break; }
-      }
-    } else {
-      if (c_armed && (prevb & BTN_CENTER) && c_press &&
-          (xTaskGetTickCount() - c_press) < pdMS_TO_TICKS(400))
-        toggle_lcd();
-      c_armed = 1;
-      c_press = 0;
-    }
-#else
-    (void)c_armed;
-#endif
-    prevb = b;
-
-#ifndef PFM_RTOS
-    if (++refresh >= 8) {
-      refresh = 0;
-      uint32_t snap[PFM_PROF_N];
-      uint64_t sum = 0;
-      for (int t = 0; t < PFM_PROF_N; t++) { snap[t] = pfm_prof_cyc[t]; pfm_prof_cyc[t] = 0; sum += snap[t]; }
-      uint64_t budget = win_frames * cpu_hz / rate;
-      win_frames = 0;
-      uint32_t drops = board_audio_underruns(), cons = board_audio_consumed_frames();
-      unsigned drpct = (cons > last_cons) ? (unsigned)((uint64_t)(drops - last_drops) * 100u / (cons - last_cons)) : 0;
-      last_drops = drops; last_cons = cons;
-      draw_cpu_bar(snap, budget);
-      char nb[8]; int cy = BAR_H + 20;
-      unsigned pct = budget ? (unsigned)(sum * 100 / budget) : 0;
-      u2a(nb, pct > 999 ? 999 : pct, 3);
-      board_lcd_fill_rect(16, cy, 13, GFX_CH, COL_BG);
-      gfx_text(16, cy, nb, pct > 100 ? COL_ERR : COL_OK, COL_BG);
-      u2a(nb, drpct > 99 ? 99 : drpct, 1);
-      board_lcd_fill_rect(50, cy, 20, GFX_CH, COL_BG);
-      int dx = gfx_text(50, cy, nb, drpct ? COL_ERR : COL_OK, COL_BG);
-      gfx_text(dx, cy, "%", COL_NUM, COL_BG);
-      board_lcd_present();
-    }
-#endif
-  }
-#ifdef PFM_RTOS
-  g_playing = 0;
-#endif
-  board_audio_close();
-  return ret;
-}
-
-#ifdef PFM_RTOS
-/* Lowest-priority meter task (see header). */
-void ui_lcd_task(void) {
-  uint32_t last_frames = 0, last_drops = 0, last_cons = 0;
-  for (;;) {
-    vTaskDelay(pdMS_TO_TICKS(60));
-    if (!g_playing || !g_lcd_on) {
-      last_frames = g_render_frames;
-      last_drops = board_audio_underruns();
-      last_cons = board_audio_consumed_frames();
-      continue;
-    }
-    uint32_t snap[PFM_PROF_N];
-    uint64_t sum = 0;
-    for (int t = 0; t < PFM_PROF_N; t++) { snap[t] = pfm_prof_cyc[t]; pfm_prof_cyc[t] = 0; sum += snap[t]; }
-    uint32_t frames = g_render_frames, df = frames - last_frames;
-    last_frames = frames;
-    uint64_t budget = (uint64_t)df * board_cpu_hz() / PFM_MIX_RATE;
-    uint32_t drops = board_audio_underruns(), cons = board_audio_consumed_frames();
-    unsigned drpct = (cons > last_cons) ? (unsigned)((uint64_t)(drops - last_drops) * 100u / (cons - last_cons)) : 0;
-    last_drops = drops;
-    last_cons = cons;
-    LCD_LOCK();
-    if (g_playing && g_lcd_on) {
-      draw_cpu_bar(snap, budget);
-      char nb[8];
-      int cy = BAR_H + 20;
-      unsigned pct = budget ? (unsigned)(sum * 100 / budget) : 0;
-      u2a(nb, pct > 999 ? 999 : pct, 3);
-      board_lcd_fill_rect(16, cy, 13, GFX_CH, COL_BG);
-      gfx_text(16, cy, nb, pct > 100 ? COL_ERR : COL_OK, COL_BG);
-      u2a(nb, drpct > 99 ? 99 : drpct, 1);
-      board_lcd_fill_rect(50, cy, 20, GFX_CH, COL_BG);
-      int dx = gfx_text(50, cy, nb, drpct ? COL_ERR : COL_OK, COL_BG);
-      gfx_text(dx, cy, "%", COL_NUM, COL_BG);
-      board_lcd_present();
-    }
-    LCD_UNLOCK();
-  }
-}
-#endif
-
-/* ---------------- flash-embedded fallback browser ---------------- */
-static int flash_play(int sel) {
-  int len = board_storage_load(sel, g_songbuf, sizeof(g_songbuf));
-  if (len <= 0) return 0;
-  pfm_player *p = pfm_player_instance();
-  pfm_player_init(p);
-  if (!pfm_player_load(p, g_songbuf, (size_t)len)) return 0;
-  const char *t = pfm_player_get_title(p);
-  return play((t && t[0]) ? t : board_storage_name(sel));
-}
-
-static void ui_run_flash(void) {
-  int n = board_storage_count();
-  if (n <= 0) {
-    LCD_LOCK(); board_lcd_clear(COL_BG); gfx_text(4, 4, "no tracks", COL_ERR, COL_BG); board_lcd_present(); LCD_UNLOCK();
-    return;
-  }
-  int sel = 0, top = 0;
-  LCD_LOCK(); draw_list(sel, top, n); LCD_UNLOCK();
-  for (;;) {
-    int ev = board_input_wait();
-    if (!ev) break;
-    if (ev == BTN_DOWN && sel < n - 1) sel++;
-    else if (ev == BTN_UP && sel > 0) sel--;
-    else if (ev == BTN_CENTER) {
-      int r = flash_play(sel);
-      while (r != 0) {
-        sel += r; if (sel < 0) sel = n - 1; else if (sel >= n) sel = 0;
-        r = flash_play(sel);
-      }
-    }
-    if (sel < top) top = sel;
-    if (sel >= top + VISROWS) top = sel - VISROWS + 1;
-    LCD_LOCK(); draw_list(sel, top, n); LCD_UNLOCK();
-  }
-}
-
-/* ---------------- SD-card hierarchical (tree) browser ---------------- */
 #ifdef PFM_RTOS
 #include "ff.h"
+
+enum { PG_BROWSER = 0, PG_PLAY = 1, PG_SETTINGS = 2, PG_N = 3 };
+static volatile int g_page = PG_BROWSER;
+
+/* --- currently playing song --- */
+static char g_cur_title[80];
+static char g_cur_name[48];
+static uint32_t g_unmute_cons;   /* consumed-frame count at which to lift the swap mute */
+static int g_muted_swap;         /* codec muted across a song swap */
+
+/* --- browser (SD tree, or flash flat when no card) --- */
 static FATFS g_fatfs;
+static int g_have_sd;
 static char g_path[256] = "/";
 #define BR_NAMELEN 48
 static char g_names[VISROWS][BR_NAMELEN];
 static uint8_t g_isdir[VISROWS];
+static int b_sel, b_top, b_count;
+static char g_play_path[256];    /* dir the playing song lives in (for prev/next) */
+static int  g_play_idx;
 
+/* --- settings --- */
+#define NSET 5
+static const char *const set_lbl[NSET] = { "Output", "FM", "SSG", "Drum", "PCM" };
+static int st_sel;
+static uint8_t g_out_speaker;    /* 0 headphone, 1 loudspeaker */
+static uint8_t g_mute[4];        /* FM, SSG, DRUM, PCM */
+
+/* ---------- SD directory helpers ---------- */
 static int sd_dir_count(void) {
   DIR dir; FILINFO fno; int n = 0;
   if (f_opendir(&dir, g_path) != FR_OK) return 0;
   while (f_readdir(&dir, &fno) == FR_OK && fno.fname[0]) n++;
   f_closedir(&dir);
   return n;
-}
-static void sd_dir_window(int top) {
-  for (int w = 0; w < VISROWS; w++) g_names[w][0] = 0;
-  DIR dir; FILINFO fno; int n = 0;
-  if (f_opendir(&dir, g_path) != FR_OK) return;
-  while (f_readdir(&dir, &fno) == FR_OK && fno.fname[0]) {
-    if (n >= top && n < top + VISROWS) {
-      int w = n - top;
-      strncpy(g_names[w], fno.fname, BR_NAMELEN - 1);
-      g_names[w][BR_NAMELEN - 1] = 0;
-      g_isdir[w] = (fno.fattrib & AM_DIR) ? 1 : 0;
-    }
-    if (++n >= top + VISROWS) break;
-  }
-  f_closedir(&dir);
 }
 static int sd_entry(int idx, char *name, int *isdir) {
   DIR dir; FILINFO fno; int n = 0, rc = -1;
@@ -433,93 +237,347 @@ static int sd_load_file(const char *name) {
   f_close(&fp);
   return (int)br;
 }
-static int sd_next_file(int idx, int dir, int count) {
-  for (int i = 0; i < count; i++) {
-    idx += dir; if (idx < 0) idx = count - 1; else if (idx >= count) idx = 0;
-    char nm[BR_NAMELEN]; int isd;
-    if (sd_entry(idx, nm, &isd) == 0 && !isd) return idx;
-  }
-  return -1;
+
+/* ---------- source layer: SD tree, or flash flat list when no card ---------- */
+static int src_count(void) {
+  if (g_have_sd) return sd_dir_count();
+  return board_storage_count();
 }
-static int sd_play_index(int idx) {
-  char name[BR_NAMELEN]; int isd;
-  if (sd_entry(idx, name, &isd) != 0 || isd) return 0;
-  int len = sd_load_file(name);
-  if (len <= 0) return 0;
-  pfm_player *p = pfm_player_instance();
-  pfm_player_init(p);
-  if (!pfm_player_load(p, g_songbuf, (size_t)len)) {
-    LCD_LOCK(); board_lcd_clear(COL_BG); gfx_text(2, 40, "not a PMD file", COL_ERR, COL_BG); board_lcd_present(); LCD_UNLOCK();
-    vTaskDelay(pdMS_TO_TICKS(700));
-    return 0;
-  }
-  const char *t = pfm_player_get_title(p);
-  return play((t && t[0]) ? t : name);
+static int src_entry(int idx, char *name, int *isdir) {
+  if (g_have_sd) return sd_entry(idx, name, isdir);
+  { const char *n = board_storage_name(idx);
+    if (!n) return -1;
+    int i = 0; for (; n[i] && i < BR_NAMELEN - 1; i++) name[i] = n[i];
+    name[i] = 0; *isdir = 0; return 0; }
 }
-static void draw_browser(int sel, int top, int count) {
-  LCD_LOCK();
+static int src_load_idx(int idx) {
+  if (g_have_sd) {
+    char nm[BR_NAMELEN]; int d;
+    if (sd_entry(idx, nm, &d) != 0 || d) return -1;
+    return sd_load_file(nm);
+  }
+  return board_storage_load(idx, g_songbuf, sizeof(g_songbuf));
+}
+static void src_window(int top) {
+  for (int w = 0; w < VISROWS; w++) g_names[w][0] = 0;
+  int cnt = src_count();
+  for (int w = 0; w < VISROWS; w++) {
+    int idx = top + w;
+    if (idx >= cnt) break;
+    int isd = 0;
+    src_entry(idx, g_names[w], &isd);
+    g_isdir[w] = (uint8_t)isd;
+  }
+}
+
+/* ---------- playback screen ---------- */
+static void draw_meter_numbers(unsigned pct, unsigned drpct) {
+  char nb[8];
+  u2a(nb, pct > 999 ? 999 : pct, 3);
+  board_lcd_fill_rect(16, PLAY_CPU_Y, 14, GFX_CH, COL_BG);
+  int x = gfx_text(16, PLAY_CPU_Y, nb, pct > 100 ? COL_ERR : COL_OK, COL_BG);
+  gfx_text(x, PLAY_CPU_Y, "%", COL_NUM, COL_BG);
+  u2a(nb, drpct > 99 ? 99 : drpct, 2);
+  board_lcd_fill_rect(78, PLAY_CPU_Y, 16, GFX_CH, COL_BG);
+  x = gfx_text(78, PLAY_CPU_Y, nb, drpct ? COL_ERR : COL_OK, COL_BG);
+  gfx_text(x, PLAY_CPU_Y, "%", COL_NUM, COL_BG);
+}
+static void draw_play_chrome(void) {
   board_lcd_clear(COL_BG);
-  board_lcd_fill_rect(0, 0, W, TITLE_H, COL_TITLE_BG);
-  gfx_text(2, 4, g_path, COL_TITLE_FG, COL_TITLE_BG);
-  sd_dir_window(top);
-  for (int r = 0; r < VISROWS; r++) {
-    int idx = top + r;
-    if (idx >= count || !g_names[r][0]) break;
-    int y = LIST_Y + r * ROW_H;
-    int issel = (idx == sel);
-    uint16_t bg = issel ? COL_SEL_BG : COL_BG;
-    uint16_t fg = issel ? COL_SEL_FG : (g_isdir[r] ? COL_SUB_FG : COL_FG);
-    board_lcd_fill_rect(0, y, W, ROW_H, bg);
-    int x = 2;
-    if (g_isdir[r]) x = gfx_text(2, y + 1, "/", COL_ACCENT, bg);
-    gfx_text(x, y + 1, g_names[r], fg, bg);
+  gfx_text(2, PLAY_TITLE_Y, g_cur_title[0] ? g_cur_title : "(no title)", COL_TITLE_FG, COL_BG);
+  gfx_text(2, PLAY_NAME_Y, g_cur_name, COL_SUB_FG, COL_BG);
+  gfx_text(2, PLAY_CPU_Y, "CPU", COL_NUM, COL_BG);
+  gfx_text(62, PLAY_CPU_Y, "DR", COL_NUM, COL_BG);
+  for (int t = 0; t < PFM_PROF_N; t++) {
+    int x = 2 + (t % 3) * 42;
+    int y = PLAY_LEG_Y + (t / 3) * 12;
+    board_lcd_fill_rect(x, y, 7, 7, task_col[t]);
+    gfx_text(x + 9, y, task_lbl[t], COL_FG, COL_BG);
   }
-  board_lcd_fill_rect(0, H - FOOT_H, W, FOOT_H, COL_TITLE_BG);
-  gfx_text(2, H - FOOT_H + 2, "UD sel LR dir C play", COL_TITLE_FG, COL_TITLE_BG);
+  draw_vol(g_volume);
+  gfx_text(2, H - 10, "holdC pages UDvol LRsong", COL_NUM, COL_BG);
   board_lcd_present();
+}
+static void toggle_lcd(void) {
+  g_lcd_on = !g_lcd_on;
+  LCD_LOCK();
+  if (g_lcd_on) draw_play_chrome();
+  else { board_lcd_clear(COL_BG); gfx_text(2, 40, "LCD off (tap C)", COL_NUM, COL_BG); board_lcd_present(); }
   LCD_UNLOCK();
 }
-static void ui_run_sd(void) {
-  int sel = 0, top = 0;
-  int count = sd_dir_count();
-  draw_browser(sel, top, count);
+
+/* ---------- browser screen ---------- */
+static void draw_browser_rows(void) {
+  src_window(b_top);
+  for (int r = 0; r < VISROWS; r++) {
+    int idx = b_top + r;
+    int y = LIST_Y + r * ROW_H;
+    int sel = (idx == b_sel && idx < b_count);
+    uint16_t bg = sel ? COL_SEL_BG : COL_BG;
+    board_lcd_fill_rect(0, y, W, ROW_H, bg);  /* in-place: no full clear, no flash */
+    if (idx < b_count && g_names[r][0]) {
+      uint16_t fg = sel ? COL_SEL_FG : (g_isdir[r] ? COL_SUB_FG : COL_FG);
+      int x = 2;
+      if (g_isdir[r]) x = gfx_text(2, y + 1, "/", COL_ACCENT, bg);
+      gfx_text(x, y + 1, g_names[r], fg, bg);
+    }
+  }
+  board_lcd_present();
+}
+static void draw_browser_full(void) {
+  board_lcd_clear(COL_BG);
+  board_lcd_fill_rect(0, 0, W, TITLE_H, COL_TITLE_BG);
+  gfx_text(2, 4, g_have_sd ? g_path : UI_TITLE, COL_TITLE_FG, COL_TITLE_BG);
+  board_lcd_fill_rect(0, H - FOOT_H, W, FOOT_H, COL_TITLE_BG);
+  gfx_text(2, H - FOOT_H + 2, "UD sel  LR dir  C play", COL_TITLE_FG, COL_TITLE_BG);
+  draw_browser_rows();
+}
+static void browse_reload(void) { b_count = src_count(); b_sel = 0; b_top = 0; }
+
+/* ---------- settings screen ---------- */
+static void set_value_str(int i, char *out) {
+  if (i == 0) strcpy(out, g_out_speaker ? "Speaker" : "Phones");
+  else strcpy(out, g_mute[i - 1] ? "Mute" : "On");
+}
+static void draw_settings_rows(void) {
+  for (int r = 0; r < NSET; r++) {
+    int y = LIST_Y + r * ROW_H;
+    int sel = (r == st_sel);
+    uint16_t bg = sel ? COL_SEL_BG : COL_BG;
+    uint16_t fg = sel ? COL_SEL_FG : COL_FG;
+    board_lcd_fill_rect(0, y, W, ROW_H, bg);
+    gfx_text(4, y + 1, set_lbl[r], fg, bg);
+    char v[16]; set_value_str(r, v);
+    uint16_t vc = sel ? COL_SEL_FG : ((r > 0 && g_mute[r - 1]) ? COL_ERR : COL_ACCENT);
+    gfx_text(70, y + 1, v, vc, bg);
+  }
+  board_lcd_present();
+}
+static void draw_settings_full(void) {
+  board_lcd_clear(COL_BG);
+  board_lcd_fill_rect(0, 0, W, TITLE_H, COL_TITLE_BG);
+  gfx_text(2, 4, "Settings", COL_TITLE_FG, COL_TITLE_BG);
+  board_lcd_fill_rect(0, H - FOOT_H, W, FOOT_H, COL_TITLE_BG);
+  gfx_text(2, H - FOOT_H + 2, "UD sel  LR change", COL_TITLE_FG, COL_TITLE_BG);
+  draw_settings_rows();
+}
+
+/* ---------- audio control ---------- */
+static void apply_mute(pfm_player *p) {
+  pfm_player_set_mute(p, g_mute[0], g_mute[1], g_mute[2], g_mute[3]);
+}
+/* Load file entry `idx` of the current browse dir and make it the playing song.
+   Mutes the codec across the swap; the super-loop lifts the mute once the old
+   ring tail has drained, so there is no transition pop. Returns 1 on success. */
+static int start_song(pfm_player *p, int idx) {
+  char name[BR_NAMELEN]; int isd;
+  if (src_entry(idx, name, &isd) != 0 || isd) return 0;
+  int len = src_load_idx(idx);
+  if (len <= 0) return 0;
+  board_audio_mute(1);
+  g_muted_swap = 1;
+  pfm_player_init(p);
+  if (!pfm_player_load(p, g_songbuf, (size_t)len)) {
+    board_audio_mute(0); g_muted_swap = 0;
+    return 0;
+  }
+  apply_mute(p);
+  const char *t = pfm_player_get_title(p);
+  strncpy(g_cur_title, (t && t[0]) ? t : name, sizeof(g_cur_title) - 1);
+  g_cur_title[sizeof(g_cur_title) - 1] = 0;
+  strncpy(g_cur_name, name, sizeof(g_cur_name) - 1);
+  g_cur_name[sizeof(g_cur_name) - 1] = 0;
+  strcpy(g_play_path, g_path);
+  g_play_idx = idx;
+  if (!g_song_loaded) { board_audio_open(PFM_MIX_RATE, 0); board_audio_set_volume(g_volume); }
+  g_render_frames = 0;
+  g_unmute_cons = board_audio_consumed_frames() + 1024; /* ~one ring drained */
+  g_song_loaded = 1;
+  return 1;
+}
+/* prev/next within the *playing* song's directory (independent of browsing). */
+static void play_step(pfm_player *p, int dir) {
+  if (!g_song_loaded) return;
+  char saved[256]; strcpy(saved, g_path); strcpy(g_path, g_play_path);
+  int cnt = src_count(), idx = g_play_idx, found = -1;
+  for (int i = 0; i < cnt; i++) {
+    idx += dir; if (idx < 0) idx = cnt - 1; else if (idx >= cnt) idx = 0;
+    char nm[BR_NAMELEN]; int isd;
+    if (src_entry(idx, nm, &isd) == 0 && !isd) { found = idx; break; }
+  }
+  if (found >= 0) start_song(p, found);
+  strcpy(g_path, saved);
+  if (g_page == PG_PLAY) { LCD_LOCK(); draw_play_chrome(); LCD_UNLOCK(); }
+}
+
+/* ---------- page dispatch ---------- */
+static void cycle_page(void) {
+  g_page = (g_page + 1) % PG_N;
+  LCD_LOCK();
+  if (g_page == PG_BROWSER) draw_browser_full();
+  else if (g_page == PG_PLAY) draw_play_chrome();
+  else draw_settings_full();
+  LCD_UNLOCK();
+}
+static void page_center(pfm_player *p) {
+  if (g_page == PG_BROWSER) {
+    char name[BR_NAMELEN]; int isd;
+    if (src_entry(b_sel, name, &isd) != 0) return;
+    if (isd) { path_push(name); browse_reload(); LCD_LOCK(); draw_browser_full(); LCD_UNLOCK(); }
+    else if (start_song(p, b_sel)) { g_page = PG_PLAY; LCD_LOCK(); draw_play_chrome(); LCD_UNLOCK(); }
+  } else if (g_page == PG_PLAY) {
+    toggle_lcd();
+  } else {                              /* settings: toggle selected item */
+    if (st_sel == 0) g_out_speaker = !g_out_speaker;
+    else g_mute[st_sel - 1] = !g_mute[st_sel - 1];
+    board_audio_set_output(g_out_speaker);
+    if (g_song_loaded) apply_mute(p);
+    LCD_LOCK(); draw_settings_rows(); LCD_UNLOCK();
+  }
+}
+static void page_nav(pfm_player *p, int edge) {
+  if (g_page == PG_BROWSER) {
+    int full = 0;
+    if (edge & BTN_DOWN) { if (b_sel < b_count - 1) b_sel++; }
+    else if (edge & BTN_UP) { if (b_sel > 0) b_sel--; }
+    else if (edge & BTN_RIGHT) {       /* descend */
+      char name[BR_NAMELEN]; int isd;
+      if (g_have_sd && src_entry(b_sel, name, &isd) == 0 && isd) { path_push(name); browse_reload(); full = 1; }
+    } else if (edge & BTN_LEFT) {      /* ascend */
+      if (g_have_sd) { path_pop(); browse_reload(); full = 1; }
+    }
+    if (b_sel < b_top) b_top = b_sel;
+    if (b_sel >= b_top + VISROWS) b_top = b_sel - VISROWS + 1;
+    LCD_LOCK();
+    if (full) draw_browser_full(); else draw_browser_rows();
+    LCD_UNLOCK();
+  } else if (g_page == PG_PLAY) {
+    if (edge & (BTN_UP | BTN_DOWN)) {
+      if ((edge & BTN_UP) && g_volume < BOARD_VOL_MAX) g_volume++;
+      else if ((edge & BTN_DOWN) && g_volume > 0) g_volume--;
+      board_audio_set_volume(g_volume);
+      if (g_lcd_on) { LCD_LOCK(); draw_vol(g_volume); board_lcd_present(); LCD_UNLOCK(); }
+    } else if (edge & BTN_RIGHT) play_step(p, +1);
+    else if (edge & BTN_LEFT) play_step(p, -1);
+  } else {                              /* settings */
+    if (edge & BTN_DOWN) { if (st_sel < NSET - 1) st_sel++; LCD_LOCK(); draw_settings_rows(); LCD_UNLOCK(); }
+    else if (edge & BTN_UP) { if (st_sel > 0) st_sel--; LCD_LOCK(); draw_settings_rows(); LCD_UNLOCK(); }
+    else if (edge & (BTN_LEFT | BTN_RIGHT)) {
+      if (st_sel == 0) g_out_speaker = !g_out_speaker;
+      else g_mute[st_sel - 1] = !g_mute[st_sel - 1];
+      board_audio_set_output(g_out_speaker);
+      if (g_song_loaded) apply_mute(p);
+      LCD_LOCK(); draw_settings_rows(); LCD_UNLOCK();
+    }
+  }
+}
+
+/* lowest-priority meter task: paints only on the Playback page */
+void ui_lcd_task(void) {
+  uint32_t last_frames = 0, last_drops = 0, last_cons = 0;
+  for (;;) {
+    vTaskDelay(pdMS_TO_TICKS(60));
+    if (g_page != PG_PLAY || !g_song_loaded || !g_lcd_on) {
+      last_frames = g_render_frames;
+      last_drops = board_audio_underruns();
+      last_cons = board_audio_consumed_frames();
+      continue;
+    }
+    uint32_t snap[PFM_PROF_N];
+    uint64_t sum = 0;
+    for (int t = 0; t < PFM_PROF_N; t++) { snap[t] = pfm_prof_cyc[t]; pfm_prof_cyc[t] = 0; sum += snap[t]; }
+    uint32_t frames = g_render_frames, df = frames - last_frames;
+    last_frames = frames;
+    uint64_t budget = (uint64_t)df * board_cpu_hz() / PFM_MIX_RATE;
+    uint32_t drops = board_audio_underruns(), cons = board_audio_consumed_frames();
+    unsigned drpct = (cons > last_cons) ? (unsigned)((uint64_t)(drops - last_drops) * 100u / (cons - last_cons)) : 0;
+    last_drops = drops; last_cons = cons;
+    unsigned pct = budget ? (unsigned)(sum * 100 / budget) : 0;
+    LCD_LOCK();
+    if (g_page == PG_PLAY && g_song_loaded && g_lcd_on) {
+      draw_cpu_bar(snap, budget);
+      draw_meter_numbers(pct, drpct);
+      board_lcd_present();
+    }
+    LCD_UNLOCK();
+  }
+}
+
+void ui_run(void) {
+  pfm_player *p = pfm_player_instance();
+  g_have_sd = (f_mount(&g_fatfs, "", 1) == FR_OK);
+  strcpy(g_path, "/");
+  board_audio_set_output(g_out_speaker);
+  browse_reload();
+  g_page = PG_BROWSER;
+  LCD_LOCK(); draw_browser_full(); LCD_UNLOCK();
+
+  int prevb = board_input_poll();
+  TickType_t c_press = 0, last_nav = 0;
+  int c_armed = !(prevb & BTN_CENTER), c_done = 0;
+  for (;;) {
+    int rendered = 0;
+    if (g_song_loaded && board_audio_ring_fill() < (int)AUD_HIGH_WATER) {
+      pfm_player_render(p, g_chunk, 512);
+      board_audio_write(g_chunk, 512);
+      g_render_frames += 512;
+      rendered = 1;
+    }
+    if (g_muted_swap && board_audio_consumed_frames() >= g_unmute_cons) {
+      board_audio_mute(0); g_muted_swap = 0;
+    }
+    int b = board_input_poll();
+    int edge = b & ~prevb;
+    TickType_t now = xTaskGetTickCount();
+    if (b & BTN_CENTER) {
+      if (c_armed && !c_done) {
+        if (!c_press) c_press = now ? now : 1;
+        else if ((now - c_press) >= pdMS_TO_TICKS(500)) { cycle_page(); c_done = 1; }
+      }
+    } else {
+      if (c_armed && (prevb & BTN_CENTER) && !c_done && c_press) page_center(p);
+      c_armed = 1; c_press = 0; c_done = 0;
+    }
+    if ((edge & (BTN_UP | BTN_DOWN | BTN_LEFT | BTN_RIGHT)) &&
+        (now - last_nav) >= pdMS_TO_TICKS(110)) {
+      page_nav(p, edge);
+      last_nav = now;
+    }
+    prevb = b;
+    if (!rendered) vTaskDelay(1);
+  }
+}
+
+#else  /* ---------------- simulator: flat flash browser + preview ------------- */
+
+static void sim_play(int sel) {
+  int len = board_storage_load(sel, g_songbuf, sizeof(g_songbuf));
+  if (len <= 0) return;
+  pfm_player *p = pfm_player_instance();
+  pfm_player_init(p);
+  if (!pfm_player_load(p, g_songbuf, (size_t)len)) return;
+  board_audio_open(PFM_MIX_RATE, 0);
+  uint32_t cap = PFM_MIX_RATE * PLAY_SECONDS, done = 0;
+  while (done < cap) {
+    pfm_player_render(p, g_chunk, 512);
+    board_audio_write(g_chunk, 512);
+    done += 512;
+    if (board_input_poll() & BTN_CENTER) break;
+  }
+  board_audio_close();
+}
+void ui_run(void) {
+  int n = board_storage_count(), sel = 0, top = 0;
+  draw_list(sel, top, n); board_lcd_present();
   for (;;) {
     int ev = board_input_wait();
     if (!ev) break;
-    if (ev == BTN_DOWN) { if (sel < count - 1) sel++; }
-    else if (ev == BTN_UP) { if (sel > 0) sel--; }
-    else if (ev == BTN_LEFT) { path_pop(); sel = 0; top = 0; count = sd_dir_count(); }
-    else if (ev == BTN_RIGHT) {
-      char name[BR_NAMELEN]; int isd;
-      if (sd_entry(sel, name, &isd) == 0 && isd) { path_push(name); sel = 0; top = 0; count = sd_dir_count(); }
-    } else if (ev == BTN_CENTER) {
-      char name[BR_NAMELEN]; int isd;
-      if (sd_entry(sel, name, &isd) == 0) {
-        if (isd) { path_push(name); sel = 0; top = 0; count = sd_dir_count(); }
-        else {
-          int idx = sel;
-          for (;;) {
-            int r = sd_play_index(idx);
-            if (r == 0) break;
-            int ni = sd_next_file(idx, r, count);
-            if (ni < 0) break;
-            idx = ni;
-          }
-          sel = idx;
-        }
-      }
-    }
+    if (ev == BTN_DOWN && sel < n - 1) sel++;
+    else if (ev == BTN_UP && sel > 0) sel--;
+    else if (ev == BTN_CENTER) sim_play(sel);
     if (sel < top) top = sel;
     if (sel >= top + VISROWS) top = sel - VISROWS + 1;
-    draw_browser(sel, top, count);
+    draw_list(sel, top, n); board_lcd_present();
   }
 }
 #endif
-
-void ui_run(void) {
-#ifdef PFM_RTOS
-  static FATFS *fs = &g_fatfs;
-  if (f_mount(fs, "", 1) == FR_OK) { ui_run_sd(); return; }
-#endif
-  ui_run_flash();
-}

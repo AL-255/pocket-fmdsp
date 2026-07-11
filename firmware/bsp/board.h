@@ -49,6 +49,8 @@ uint32_t board_cpu_hz(void);
 /* ---- audio out (interleaved stereo int16) ---- */
 #define BOARD_VOL_MAX 10
 void board_audio_set_volume(int level); /* 0..BOARD_VOL_MAX; codec HP gain */
+void board_audio_mute(int on);          /* codec output mute (song-change pop guard) */
+void board_audio_set_output(int speaker); /* 0 = headphone, 1 = loudspeaker */
 uint32_t board_audio_underruns(void);        /* cumulative dropped frames */
 uint32_t board_audio_consumed_frames(void);  /* cumulative frames the DMA has played */
 int32_t  board_audio_ring_fill(void);        /* queued frames now; <0 = underrunning */

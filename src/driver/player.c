@@ -45,7 +45,9 @@ static void int_cb(void *u) {
   struct fmdriver_work *w = (struct fmdriver_work *)u;
   w->driver_opna_interrupt(w);
 }
+static bool g_pcm_muted; /* PCM (ADPCM/PPZ) sits outside the OPNA mask */
 static void mix_cb(void *u, int16_t *buf, unsigned samples) {
+  if (g_pcm_muted) return; /* leave the FM/SSG/drum mix untouched */
   ppz8_mix((struct ppz8 *)u, buf, samples);
 }
 
@@ -85,6 +87,15 @@ PFM_HOT void pfm_player_render(pfm_player *p, int16_t *buf, size_t frames) {
 }
 
 unsigned pfm_player_loopcount(const pfm_player *p) { return p->work.loop_cnt; }
+
+void pfm_player_set_mute(pfm_player *p, int fm, int ssg, int drum, int pcm) {
+  unsigned m = 0;
+  if (fm)   m |= 0x3fu;    /* FM 1-6   */
+  if (ssg)  m |= 0x1c0u;   /* SSG 1-3  */
+  if (drum) m |= 0x7e00u;  /* rhythm   */
+  opna_set_mask(&p->opna, m);
+  g_pcm_muted = pcm ? true : false;
+}
 
 const char *pfm_player_get_title(pfm_player *p) {
   if (p->work.get_comment) {
