@@ -37,6 +37,7 @@
 static uint8_t g_songbuf[22 * 1024]; /* >= SONG_MAX_LEN (21071); rest freed for .ramfunc */
 static int16_t g_chunk[512 * 2];
 static int g_volume = 5;             /* 0..BOARD_VOL_MAX, persists across songs */
+static int g_lcd_on = 1;             /* tap C toggles LCD drawing during playback */
 
 static void u2a(char *d, unsigned v, int width) { /* right-aligned decimal */
   char t[8];
@@ -123,6 +124,25 @@ static void draw_vol(int vol) {
   board_lcd_fill_rect(40, y + 1, fw, 5, COL_BAR);
 }
 
+#define PLAY_LEGEND_Y (BAR_H + 60)
+
+/* (Re)draw the static playback screen chrome (title, legend, volume, hint). */
+static void draw_play_chrome(int sel) {
+  board_lcd_clear(COL_BG);
+  gfx_text(2, BAR_H + 4, UI_NOWPLAYING, COL_TITLE_FG, COL_BG);
+  const char *grp = board_storage_group(sel);
+  if (grp && grp[0]) gfx_text(2, BAR_H + 16, grp, COL_SUB_FG, COL_BG);
+  gfx_text(2, BAR_H + 28, board_storage_name(sel), COL_FG, COL_BG);
+  for (int t = 0; t < PFM_PROF_N; t++) {
+    int yy = PLAY_LEGEND_Y + t * 12;
+    board_lcd_fill_rect(2, yy, 9, 9, task_col[t]);
+    gfx_text(14, yy + 1, task_lbl[t], COL_FG, COL_BG);
+  }
+  draw_vol(g_volume);
+  gfx_text(2, H - 10, "UD:vol LR:song Ctap:lcd Chold:back", COL_NUM, COL_BG);
+  board_lcd_present();
+}
+
 /* Returns 0 = back to menu, -1 = previous song, +1 = next song. */
 static int play(int sel) {
   board_lcd_clear(COL_BG);
@@ -148,23 +168,15 @@ static int play(int sel) {
   unsigned rate = PFM_MIX_RATE;
   board_audio_open(rate, 0);
   board_audio_set_volume(g_volume);
-
-  /* static legend (colour swatch + task name) */
-  int ly = BAR_H + 60;
-  for (int t = 0; t < PFM_PROF_N; t++) {
-    int yy = ly + t * 12;
-    board_lcd_fill_rect(2, yy, 9, 9, task_col[t]);
-    gfx_text(14, yy + 1, task_lbl[t], COL_FG, COL_BG);
-  }
-  draw_vol(g_volume);
-  gfx_text(2, H - 10, "U/D vol  L/R song  C back", COL_NUM, COL_BG);
-  board_lcd_present();
+  if (g_lcd_on) draw_play_chrome(sel);
+  else { board_lcd_clear(COL_BG); gfx_text(2, 40, "LCD off (tap C)", COL_NUM, COL_BG); board_lcd_present(); }
 
   for (int t = 0; t < PFM_PROF_N; t++) pfm_prof_cyc[t] = 0;
   uint32_t cpu_hz = board_cpu_hz();
   uint64_t win_frames = 0;
-  int refresh = 0, ret = 0;
+  int refresh = 0, ret = 0, c_held = 0;
   int prevb = board_input_poll(); /* current held buttons (e.g. the start-press) */
+  int c_armed = !(prevb & BTN_CENTER); /* ignore C until the start-press releases */
 #ifdef PFM_SIM
   uint32_t cap = rate * PLAY_SECONDS, done = 0; /* bounded render for the WAV harness */
 #endif
@@ -180,19 +192,30 @@ static int play(int sel) {
 #else
     int b = board_input_poll();
     int edge = b & ~prevb; /* new presses only */
-    prevb = b;
-    if (edge & BTN_CENTER) { ret = 0; break; }
-    else if (edge & BTN_LEFT) { ret = -1; break; }
+    if (edge & BTN_LEFT) { ret = -1; break; }
     else if (edge & BTN_RIGHT) { ret = 1; break; }
     else if (edge & BTN_UP) {
       if (g_volume < BOARD_VOL_MAX) g_volume++;
       board_audio_set_volume(g_volume);
-      draw_vol(g_volume);
+      if (g_lcd_on) draw_vol(g_volume);
     } else if (edge & BTN_DOWN) {
       if (g_volume > 0) g_volume--;
       board_audio_set_volume(g_volume);
-      draw_vol(g_volume);
+      if (g_lcd_on) draw_vol(g_volume);
     }
+    /* CENTER: hold ~0.4s -> back to menu; short tap -> toggle LCD drawing */
+    if (b & BTN_CENTER) {
+      if (c_armed && ++c_held >= 40) { ret = 0; break; }
+    } else {
+      if (c_armed && (prevb & BTN_CENTER) && c_held > 0 && c_held < 40) {
+        g_lcd_on = !g_lcd_on;
+        if (g_lcd_on) draw_play_chrome(sel);
+        else { board_lcd_clear(COL_BG); gfx_text(2, 40, "LCD off (tap C)", COL_NUM, COL_BG); board_lcd_present(); }
+      }
+      c_armed = 1;
+      c_held = 0;
+    }
+    prevb = b;
 #endif
 
     if (++refresh >= 8) {
@@ -206,29 +229,29 @@ static int play(int sel) {
       }
       uint64_t budget = win_frames * cpu_hz / rate; /* realtime cycles for the window */
       win_frames = 0;
-      draw_cpu_bar(snap, budget);
-      char nb[8];
-      /* total */
-      unsigned pct = budget ? (unsigned)(sum * 100 / budget) : 0;
-      int cy = BAR_H + 44;
-      board_lcd_fill_rect(2, cy, W - 4, GFX_CH + 2, COL_BG);
-      int xx = gfx_text(2, cy, "CPU ", COL_NUM, COL_BG);
-      u2a(nb, pct > 999 ? 999 : pct, 3);
-      xx = gfx_text(xx, cy, nb, pct > 100 ? COL_ERR : COL_OK, COL_BG);
-      xx = gfx_text(xx, cy, "% DROP ", COL_NUM, COL_BG);
-      unsigned drops = board_audio_underruns();
-      u2a(nb, drops > 9999 ? 9999 : drops, 1);
-      gfx_text(xx, cy, nb, drops ? COL_ERR : COL_OK, COL_BG);
-      /* per-task % next to each legend swatch */
-      for (int t = 0; t < PFM_PROF_N; t++) {
-        unsigned tp = budget ? (unsigned)((uint64_t)snap[t] * 100 / budget) : 0;
-        int yy = ly + t * 12 + 1;
-        u2a(nb, tp > 999 ? 999 : tp, 3);
-        board_lcd_fill_rect(84, yy, W - 84, GFX_CH, COL_BG);
-        int px = gfx_text(84, yy, nb, task_col[t], COL_BG);
-        gfx_text(px, yy, "%", COL_NUM, COL_BG);
+      if (g_lcd_on) {                 /* skip all LCD writes when toggled off */
+        draw_cpu_bar(snap, budget);
+        char nb[8];
+        unsigned pct = budget ? (unsigned)(sum * 100 / budget) : 0;
+        int cy = BAR_H + 44;
+        board_lcd_fill_rect(2, cy, W - 4, GFX_CH + 2, COL_BG);
+        int xx = gfx_text(2, cy, "CPU ", COL_NUM, COL_BG);
+        u2a(nb, pct > 999 ? 999 : pct, 3);
+        xx = gfx_text(xx, cy, nb, pct > 100 ? COL_ERR : COL_OK, COL_BG);
+        xx = gfx_text(xx, cy, "% DROP ", COL_NUM, COL_BG);
+        unsigned drops = board_audio_underruns();
+        u2a(nb, drops > 9999 ? 9999 : drops, 1);
+        gfx_text(xx, cy, nb, drops ? COL_ERR : COL_OK, COL_BG);
+        for (int t = 0; t < PFM_PROF_N; t++) {
+          unsigned tp = budget ? (unsigned)((uint64_t)snap[t] * 100 / budget) : 0;
+          int yy = PLAY_LEGEND_Y + t * 12 + 1;
+          u2a(nb, tp > 999 ? 999 : tp, 3);
+          board_lcd_fill_rect(84, yy, W - 84, GFX_CH, COL_BG);
+          int px = gfx_text(84, yy, nb, task_col[t], COL_BG);
+          gfx_text(px, yy, "%", COL_NUM, COL_BG);
+        }
+        board_lcd_present();
       }
-      board_lcd_present();
     }
   }
   board_audio_close();

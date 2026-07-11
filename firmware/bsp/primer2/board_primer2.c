@@ -398,16 +398,24 @@ static void i2s_dma_init(void) {
 
 static unsigned ring_read_pos(void) { return (AUD_RING * 2) - DMA2_CNDTR2; }
 
-static uint32_t g_underruns; /* times the producer found the DMA ring drained */
-static int g_ring_primed;    /* set once the ring has first filled (skip startup) */
-uint32_t board_audio_underruns(void) { return g_underruns; }
+/* Drop metric: the DMA read cursor advances at exactly I2S_FS (it is our clock).
+   Count cumulative samples it consumes vs samples the producer has written; any
+   time consumption out-runs production the ring underran and those frames were
+   stale = dropped. */
+static uint32_t g_written_s;   /* cumulative samples written (ring pre-fill incl.) */
+static uint32_t g_consumed_s;  /* cumulative samples the DMA has read */
+static uint32_t g_dropped_s;   /* cumulative stale (dropped) samples */
+static unsigned g_last_rd;     /* previous DMA read position */
+uint32_t board_audio_underruns(void) { return g_dropped_s >> 1; } /* frames */
 
 void board_audio_open(unsigned rate, uint32_t total_frames) {
   (void)rate; (void)total_frames;
   for (unsigned i = 0; i < AUD_RING * 2; i++) g_ring[i] = 0;
   g_wr = 0;
-  g_underruns = 0;
-  g_ring_primed = 0;
+  g_written_s = AUD_RING * 2; /* ring starts pre-filled with silence */
+  g_consumed_s = 0;
+  g_dropped_s = 0;
+  g_last_rd = 0;
   codec_init();
   i2s_dma_init();
 }
@@ -418,14 +426,15 @@ void board_audio_open(unsigned rate, uint32_t total_frames) {
 PFM_HOT void board_audio_write(const int16_t *src, size_t frames) {
   uint32_t prof_t0 = pfm_prof_begin();
   const unsigned size = AUD_RING * 2;         /* samples in the ring */
-  /* Frame-drop detector: if the ring is (near) empty when we arrive, the DMA
-     drained everything during the render and has been replaying stale samples. */
+  /* advance the consumed counter and account any underrun since the last call */
   {
-    unsigned rd0 = ring_read_pos() & ~1u;
-    unsigned fill0 = (g_wr - rd0) & (size - 1u);
-    if (fill0 < 16u) { if (g_ring_primed) g_underruns++; }
-    else g_ring_primed = 1;
+    unsigned rd = ring_read_pos() & ~1u;
+    g_consumed_s += (rd - g_last_rd) & (size - 1u);
+    g_last_rd = rd;
+    int32_t deficit = (int32_t)(g_consumed_s - g_written_s);
+    if (deficit > 0) { g_dropped_s += (uint32_t)deficit; g_written_s = g_consumed_s; }
   }
+  g_written_s += (uint32_t)(frames * 2);
   size_t total = frames * 2, done = 0;
   while (done < total) {
     unsigned rd = ring_read_pos() & ~1u;      /* DMA read cursor (one AHB read) */
