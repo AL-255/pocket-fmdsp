@@ -64,10 +64,12 @@ static int tone_volume(const struct opna_ssg *ssg, int ch) { return ssg->regs[0x
 
 PFM_HOT void opna_ssg_mix(struct opna_ssg *ssg, struct opna_ssg_resampler *r,
                   int16_t *buf, unsigned samples) {
-  /* Hoist the mix-invariant register decode AND all mutable state (counters,
-     LFSR, envelope, tone flip-flops, ring index) into locals. Without this the
-     compiler reloads/stores them through the ssg pointer every raw sample,
-     because it cannot prove the r->buf writes do not alias ssg. */
+  /* Reduced-oversampling resampler: the tone/noise/env counters still advance at
+     the native rate (so pitch is exact), but instead of writing every raw sample
+     into a ring and running a 9-tap sliding box, we block-average the raw samples
+     that fall in each output step (4 or 5) directly. Drops the whole ring + FIR
+     memory traffic; slightly more aliasing on the square/noise channels. */
+  static const int32_t inv[6] = { 0, 0, 0, 0, 8192, 6554 }; /* Q15 1/4, 1/5 */
   const unsigned tp[3] = { tone_period(ssg, 0), tone_period(ssg, 1), tone_period(ssg, 2) };
   const unsigned np = (unsigned)noise_period(ssg);
   const unsigned ep = (unsigned)env_period(ssg);
@@ -84,14 +86,15 @@ PFM_HOT void opna_ssg_mix(struct opna_ssg *ssg, struct opna_ssg_resampler *r,
   uint16_t ec = ssg->env_counter;
   uint8_t el = ssg->env_level;
   bool eatt = ssg->env_att, eholding = ssg->env_holding;
-  uint16_t tc[3] = { ssg->tone_counter[0], ssg->tone_counter[1], ssg->tone_counter[2] };
-  bool to[3] = { ssg->tone_out[0], ssg->tone_out[1], ssg->tone_out[2] };
+  uint16_t tc0 = ssg->tone_counter[0], tc1 = ssg->tone_counter[1], tc2 = ssg->tone_counter[2];
+  bool to0 = ssg->tone_out[0], to1 = ssg->tone_out[1], to2 = ssg->tone_out[2];
   unsigned idx = r->index;
-  int16_t *rbuf = r->buf;
 
   for (unsigned i = 0; i < samples; i++) {
-    unsigned ssg_samples = ((idx + 9) >> 1) - (idx >> 1);
-    for (unsigned j = 0; j < ssg_samples; j++) {
+    unsigned ticks = ((idx + 9) >> 1) - (idx >> 1); /* 4 or 5 */
+    idx = (idx + 9) & (2 * PFM_SSG_RING - 1);
+    int32_t s0 = 0, s1 = 0, s2 = 0;
+    for (unsigned k = 0; k < ticks; k++) {
       if (((++nc) >> 1) >= np) {
         nc = 0;
         lfsr |= (!((lfsr & 1) ^ ((lfsr >> 3) & 1))) << 17;
@@ -110,32 +113,27 @@ PFM_HOT void opna_ssg_mix(struct opna_ssg *ssg, struct opna_ssg_resampler *r,
       }
       const unsigned lfsr1 = lfsr & 1;
       const int envlvl = eatt ? el : 31 - el;
-      const unsigned pos = BUFINDEX(idx, j) * 3;
-      for (int ch = 0; ch < 3; ch++) {
-        if (++tc[ch] >= tp[ch]) { tc[ch] = 0; to[ch] = !to[ch]; }
-        int level = cenv[ch] ? envlvl : tv[ch];
-        int16_t o;
-        if (!(tdis[ch] && ndis[ch])) {
-          bool toneout = tp[ch] < 8 ? true : to[ch];
-          bool on = (toneout || tdis[ch]) && (lfsr1 || ndis[ch]);
-          o = on ? (int16_t)voltable[level] : (int16_t)(-(int)voltable[level]);
-        } else {
-          o = (int16_t)(voltable[level] * 2);
-        }
-        rbuf[pos + ch] = o;
-      }
+      if (++tc0 >= tp[0]) { tc0 = 0; to0 = !to0; }
+      if (++tc1 >= tp[1]) { tc1 = 0; to1 = !to1; }
+      if (++tc2 >= tp[2]) { tc2 = 0; to2 = !to2; }
+      int l0 = cenv[0] ? envlvl : tv[0];
+      int l1 = cenv[1] ? envlvl : tv[1];
+      int l2 = cenv[2] ? envlvl : tv[2];
+      if (!(tdis[0] && ndis[0]))
+        s0 += ((tp[0] < 8 ? true : to0) || tdis[0]) && (lfsr1 || ndis[0]) ? voltable[l0] : -(int)voltable[l0];
+      else s0 += voltable[l0] * 2;
+      if (!(tdis[1] && ndis[1]))
+        s1 += ((tp[1] < 8 ? true : to1) || tdis[1]) && (lfsr1 || ndis[1]) ? voltable[l1] : -(int)voltable[l1];
+      else s1 += voltable[l1] * 2;
+      if (!(tdis[2] && ndis[2]))
+        s2 += ((tp[2] < 8 ? true : to2) || tdis[2]) && (lfsr1 || ndis[2]) ? voltable[l2] : -(int)voltable[l2];
+      else s2 += voltable[l2] * 2;
     }
-    idx = (idx + 9) & (2 * PFM_SSG_RING - 1);
-
-    /* box-average /9 (rectangular FIR matching the 9/2 ratio) */
+    int32_t rr = inv[ticks];
     int32_t sample = 0;
-    for (int ch = 0; ch < 3; ch++) {
-      unsigned ind = (idx & 1) ? BUFINDEX(idx, 5) : BUFINDEX(idx, 0);
-      int32_t out = rbuf[ind * 3 + ch];
-      for (int s = 0; s < 4; s++) out += rbuf[BUFINDEX(idx, s + 1) * 3 + ch] * 2;
-      out /= 9;
-      if (!(mask & (1u << ch))) sample += out;
-    }
+    if (!(mask & 1u)) sample += (s0 * rr) >> 15;
+    if (!(mask & 2u)) sample += (s1 * rr) >> 15;
+    if (!(mask & 4u)) sample += (s2 * rr) >> 15;
     int32_t lo = buf[i * 2 + 0] + sample;
     int32_t ro = buf[i * 2 + 1] + sample;
     buf[i * 2 + 0] = (int16_t)pfm_clamp16(lo);
@@ -148,7 +146,7 @@ PFM_HOT void opna_ssg_mix(struct opna_ssg *ssg, struct opna_ssg_resampler *r,
   ssg->env_level = el;
   ssg->env_att = eatt;
   ssg->env_holding = eholding;
-  ssg->tone_counter[0] = tc[0]; ssg->tone_counter[1] = tc[1]; ssg->tone_counter[2] = tc[2];
-  ssg->tone_out[0] = to[0]; ssg->tone_out[1] = to[1]; ssg->tone_out[2] = to[2];
+  ssg->tone_counter[0] = tc0; ssg->tone_counter[1] = tc1; ssg->tone_counter[2] = tc2;
+  ssg->tone_out[0] = to0; ssg->tone_out[1] = to1; ssg->tone_out[2] = to2;
   r->index = idx;
 }

@@ -398,10 +398,16 @@ static void i2s_dma_init(void) {
 
 static unsigned ring_read_pos(void) { return (AUD_RING * 2) - DMA2_CNDTR2; }
 
+static uint32_t g_underruns; /* times the producer found the DMA ring drained */
+static int g_ring_primed;    /* set once the ring has first filled (skip startup) */
+uint32_t board_audio_underruns(void) { return g_underruns; }
+
 void board_audio_open(unsigned rate, uint32_t total_frames) {
   (void)rate; (void)total_frames;
   for (unsigned i = 0; i < AUD_RING * 2; i++) g_ring[i] = 0;
   g_wr = 0;
+  g_underruns = 0;
+  g_ring_primed = 0;
   codec_init();
   i2s_dma_init();
 }
@@ -412,6 +418,14 @@ void board_audio_open(unsigned rate, uint32_t total_frames) {
 PFM_HOT void board_audio_write(const int16_t *src, size_t frames) {
   uint32_t prof_t0 = pfm_prof_begin();
   const unsigned size = AUD_RING * 2;         /* samples in the ring */
+  /* Frame-drop detector: if the ring is (near) empty when we arrive, the DMA
+     drained everything during the render and has been replaying stale samples. */
+  {
+    unsigned rd0 = ring_read_pos() & ~1u;
+    unsigned fill0 = (g_wr - rd0) & (size - 1u);
+    if (fill0 < 16u) { if (g_ring_primed) g_underruns++; }
+    else g_ring_primed = 1;
+  }
   size_t total = frames * 2, done = 0;
   while (done < total) {
     unsigned rd = ring_read_pos() & ~1u;      /* DMA read cursor (one AHB read) */

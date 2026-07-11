@@ -213,9 +213,12 @@ static int play(int sel) {
       int cy = BAR_H + 44;
       board_lcd_fill_rect(2, cy, W - 4, GFX_CH + 2, COL_BG);
       int xx = gfx_text(2, cy, "CPU ", COL_NUM, COL_BG);
-      xx = gfx_text(xx, cy, (u2a(nb, pct > 999 ? 999 : pct, 3), nb),
-                    pct > 100 ? COL_ERR : COL_OK, COL_BG);
-      gfx_text(xx, cy, "% realtime", COL_NUM, COL_BG);
+      u2a(nb, pct > 999 ? 999 : pct, 3);
+      xx = gfx_text(xx, cy, nb, pct > 100 ? COL_ERR : COL_OK, COL_BG);
+      xx = gfx_text(xx, cy, "% DROP ", COL_NUM, COL_BG);
+      unsigned drops = board_audio_underruns();
+      u2a(nb, drops > 9999 ? 9999 : drops, 1);
+      gfx_text(xx, cy, nb, drops ? COL_ERR : COL_OK, COL_BG);
       /* per-task % next to each legend swatch */
       for (int t = 0; t < PFM_PROF_N; t++) {
         unsigned tp = budget ? (unsigned)((uint64_t)snap[t] * 100 / budget) : 0;
