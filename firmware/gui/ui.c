@@ -177,6 +177,9 @@ static char g_cur_name[48];
 static uint32_t g_unmute_cons;   /* consumed-frame count at which to lift the swap mute */
 static int g_muted_swap;         /* codec muted across a song swap */
 static int g_dbg_len;            /* last load: bytes read (>0) or negative error */
+static uint32_t g_load_ms;       /* last song load wall time (ms) */
+static uint32_t g_load_kbps;     /* last song load throughput (KB/s approx) */
+#define DWT_CYCCNT (*(volatile uint32_t *)0xE0001004u)
 
 /* --- browser (SD only) --- */
 static FATFS g_fatfs;
@@ -303,15 +306,17 @@ static int dbg_app(char *d, int o, const char *lab, int v) {
 }
 static void draw_dbg(void) {
   char s[48]; int o = 0;
+  /* SD perf: L=load bytes, t=load ms, K=KB/s, E=read errors */
   o = dbg_app(s, o, "L", g_dbg_len);
-  o = dbg_app(s, o, "fill", board_audio_ring_fill());
+  o = dbg_app(s, o, "t", (int)g_load_ms);
+  o = dbg_app(s, o, "K", (int)g_load_kbps);
   o = dbg_app(s, o, "E", (int)board_sd_read_errors());
   board_lcd_fill_rect(2, PLAY_DBG_Y, W - 4, GFX_CH, COL_BG);
   gfx_text(2, PLAY_DBG_Y, s, COL_NUM, COL_BG);
   o = 0;
+  o = dbg_app(s, o, "f", board_audio_ring_fill());
   o = dbg_app(s, o, "sd", g_have_sd);
   o = dbg_app(s, o, "rc", g_mount_rc);
-  o = dbg_app(s, o, "ld", g_song_loaded);
   o = dbg_app(s, o, "m", g_muted_swap);
   board_lcd_fill_rect(2, PLAY_DBG_Y + 11, W - 4, GFX_CH, COL_BG);
   gfx_text(2, PLAY_DBG_Y + 11, s, COL_NUM, COL_BG);
@@ -444,6 +449,7 @@ static int start_song(pfm_player *p, int idx) {
   g_muted_swap = 1;
 
   int len = 0, ok = 0;             /* 2. load the buffer (blocking SD, no render racing) */
+  uint32_t t0 = DWT_CYCCNT;
   for (int attempt = 0; attempt < 3 && !ok; attempt++) {
     len = src_load_idx(idx);
     g_dbg_len = len;
@@ -452,6 +458,9 @@ static int start_song(pfm_player *p, int idx) {
     if (pfm_player_load(p, g_songbuf, (size_t)len)) ok = 1;
     else g_dbg_len = -99;
   }
+  uint32_t khz = board_cpu_hz() / 1000u;
+  g_load_ms = (DWT_CYCCNT - t0) / (khz ? khz : 1u);
+  g_load_kbps = (g_load_ms && len > 0) ? ((uint32_t)len * 1000u) / (g_load_ms * 1024u) : 0;
   if (!ok) {                       /* give up: stop cleanly, don't render garbage */
     g_song_loaded = 0;
     board_audio_mute(0); g_muted_swap = 0;

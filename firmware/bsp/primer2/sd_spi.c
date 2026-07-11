@@ -61,6 +61,39 @@ SD_HOT static uint8_t xchg(uint8_t out) {
   return in;
 }
 
+/* MISO settle after the SCK rising edge, in nops. Fewer = faster but riskier on
+   marginal wiring; bump if the SD error/fail counters climb or audio corrupts. */
+#define SD_RD_SETTLE "nop\n nop\n"
+
+/* Fast data-read: clock in `n` bytes with MOSI held high, MSB first, SPI mode 0.
+   Hand-written Thumb-2, 8x unrolled, addresses/masks hoisted into registers, run
+   from SRAM (.ramfunc). This is the block-read hot path (the C xchg is only used
+   for the few command bytes). GPIOC: SCK=PC12, MISO=PC8. */
+SD_HOT static void sd_read_data(uint8_t *buf, unsigned n) {
+  if (!n) return;
+  MOSI_HI();                                  /* send 0xFF throughout the read */
+  volatile uint32_t *bsrr = &BSRR(GPIOC);
+  volatile uint32_t *idr = &IDR(GPIOC);
+  uint32_t acc, tmp;
+  __asm__ volatile(
+    "1:                                   \n"
+    "   movs   %[acc], #0                 \n"   /* in = 0 */
+    ".rept 8                              \n"
+    "   str    %[hi], [%[bsrr]]           \n"   /* SCK high (sample edge) */
+    "   " SD_RD_SETTLE "                  \n"   /* MISO settle */
+    "   ldr    %[tmp], [%[idr]]           \n"   /* read port */
+    "   str    %[lo], [%[bsrr]]           \n"   /* SCK low */
+    "   ubfx   %[tmp], %[tmp], #8, #1     \n"   /* isolate MISO (PC8) */
+    "   orr    %[acc], %[tmp], %[acc], lsl #1 \n" /* in = (in<<1) | miso */
+    ".endr                               \n"
+    "   strb   %[acc], [%[buf]], #1       \n"   /* *buf++ = in */
+    "   subs   %[n], %[n], #1             \n"
+    "   bne    1b                         \n"
+    : [buf] "+r"(buf), [n] "+r"(n), [acc] "=&r"(acc), [tmp] "=&r"(tmp)
+    : [bsrr] "r"(bsrr), [idr] "r"(idr), [hi] "r"(1u << 12), [lo] "r"(1u << 28)
+    : "memory", "cc");
+}
+
 
 static void gpio_setup(void) {
   REG32(0x40021018) |= (1u << 4) | (1u << 5); /* RCC_APB2ENR: IOPC, IOPD */
@@ -154,7 +187,7 @@ SD_HOT static int read_one_block(uint32_t arg, uint8_t *buf) {
   uint8_t tok;
   do { tok = xchg(0xFF); } while (tok == 0xFF && --tries); /* wait data token */
   if (tok != 0xFE) { CS_HI(); xchg(0xFF); return -3; }
-  for (int i = 0; i < 512; i++) buf[i] = xchg(0xFF);
+  sd_read_data(buf, 512);            /* fast assembly block read */
   xchg(0xFF); xchg(0xFF);            /* discard CRC */
   CS_HI();
   xchg(0xFF);
