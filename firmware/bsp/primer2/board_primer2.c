@@ -407,6 +407,16 @@ static uint32_t g_consumed_s;  /* cumulative samples the DMA has read */
 static uint32_t g_dropped_s;   /* cumulative stale (dropped) samples */
 static unsigned g_last_rd;     /* previous DMA read position */
 uint32_t board_audio_underruns(void) { return g_dropped_s >> 1; } /* frames */
+uint32_t board_audio_consumed_frames(void) { return g_consumed_s >> 1; }
+
+/* Instantaneous ring headroom in frames (signed; <0 means underrunning). Used
+   by the UI to run the LCD at lowest priority: it only paints when there is
+   enough buffered audio to survive the draw, so it never starves the codec. */
+int32_t board_audio_ring_fill(void) {
+  unsigned rd = ring_read_pos() & ~1u;
+  uint32_t consumed_now = g_consumed_s + ((rd - g_last_rd) & (AUD_RING * 2 - 1u));
+  return (int32_t)(g_written_s - consumed_now) >> 1;
+}
 
 void board_audio_open(unsigned rate, uint32_t total_frames) {
   (void)rate; (void)total_frames;

@@ -115,6 +115,8 @@ static void put16(uint8_t *p, uint16_t v) { p[0]=v; p[1]=v>>8; }
 
 void board_audio_set_volume(int level) { (void)level; }
 uint32_t board_audio_underruns(void) { return 0; }
+uint32_t board_audio_consumed_frames(void) { return 0; }
+int32_t board_audio_ring_fill(void) { return 1 << 20; } /* sim: always draw */
 
 void board_audio_open(unsigned rate, uint32_t total_frames) {
   char path[] = "sim_play_000.wav";

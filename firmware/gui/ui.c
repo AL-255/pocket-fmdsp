@@ -183,6 +183,7 @@ static int play(int sel) {
   int refresh = 0, ret = 0, c_held = 0;
   int prevb = board_input_poll(); /* current held buttons (e.g. the start-press) */
   int c_armed = !(prevb & BTN_CENTER); /* ignore C until the start-press releases */
+  uint32_t last_drops = 0, last_cons = 0; /* for the windowed drop-rate */
 #ifdef PFM_SIM
   uint32_t cap = rate * PLAY_SECONDS, done = 0; /* bounded render for the WAV harness */
 #endif
@@ -235,7 +236,16 @@ static int play(int sel) {
       }
       uint64_t budget = win_frames * cpu_hz / rate; /* realtime cycles for the window */
       win_frames = 0;
-      if (g_lcd_on) {                 /* minimal dynamic draw: bar + two numbers */
+      /* drop RATE this window: dropped frames / real-time frames, as a percent */
+      uint32_t drops = board_audio_underruns();
+      uint32_t cons = board_audio_consumed_frames();
+      unsigned drpct = (cons > last_cons)
+          ? (unsigned)((uint64_t)(drops - last_drops) * 100u / (cons - last_cons)) : 0;
+      last_drops = drops;
+      last_cons = cons;
+      /* LCD is lowest priority: only paint when audio has spare buffer, so a
+         redraw can never starve the codec. Under load the meter drops frames. */
+      if (g_lcd_on && board_audio_ring_fill() > 256) {
         draw_cpu_bar(snap, budget);
         char nb[8];
         int cy = BAR_H + 44;
@@ -243,10 +253,10 @@ static int play(int sel) {
         u2a(nb, pct > 999 ? 999 : pct, 3);
         board_lcd_fill_rect(16, cy, 13, GFX_CH, COL_BG);
         gfx_text(16, cy, nb, pct > 100 ? COL_ERR : COL_OK, COL_BG);
-        unsigned drops = board_audio_underruns();
-        u2a(nb, drops > 9999 ? 9999 : drops, 1);
+        u2a(nb, drpct > 99 ? 99 : drpct, 1);
         board_lcd_fill_rect(50, cy, 20, GFX_CH, COL_BG);
-        gfx_text(50, cy, nb, drops ? COL_ERR : COL_OK, COL_BG);
+        int dx = gfx_text(50, cy, nb, drpct ? COL_ERR : COL_OK, COL_BG);
+        gfx_text(dx, cy, "%", COL_NUM, COL_BG);
         board_lcd_present();
       }
     }
