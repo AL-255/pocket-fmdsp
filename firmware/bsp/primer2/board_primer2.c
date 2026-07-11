@@ -390,7 +390,10 @@ static void codec_init(void) {
   cr[4] = 0x6f;
   cr[5] = 0x17;
   cr[6] = g_cr6;              /* headphone (PHL/PHR) + SE, loudspeaker off, not muted */
-  cr[7] = 0x04;               /* loudspeaker output gain (fixed; volume is digital) */
+  cr[7] = 0x00;               /* CR7 LSA(3:0)=0000 -> earpiece/loudspeaker amp at its
+                                 max +6 dB gain (was 0x04 = -2 dB, i.e. 8 dB quieter).
+                                 Fine level is still the digital volume; drop a step or
+                                 two if loud tracks clip the 8 ohm / 300 mW driver. */
   cr[8] = 0x00;               /* HP gain L: loudest (digital volume scales samples) */
   cr[9] = 0x00;               /* HP gain R: loudest */
   cr[12] = 0x84;
