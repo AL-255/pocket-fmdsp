@@ -336,7 +336,8 @@ static void i2c_codec_write_reg(uint8_t reg, uint8_t val) {
 void board_audio_set_volume(int level) {
   if (level < 0) level = 0;
   if (level > BOARD_VOL_MAX) level = BOARD_VOL_MAX;
-  uint8_t g = (uint8_t)(level * 3); /* 0..30, ~0x14 at the mid default */
+  /* CR8/CR9 are attenuation (higher = quieter), so invert: level 10 -> 0 (loud). */
+  uint8_t g = (uint8_t)((BOARD_VOL_MAX - level) * 3);
   i2c_codec_write_reg(8, g);
   i2c_codec_write_reg(9, g);
 }

@@ -64,78 +64,91 @@ static int tone_volume(const struct opna_ssg *ssg, int ch) { return ssg->regs[0x
 
 PFM_HOT void opna_ssg_mix(struct opna_ssg *ssg, struct opna_ssg_resampler *r,
                   int16_t *buf, unsigned samples) {
-  /* Hoist everything derived only from the (mix-invariant) register file out of
-     the 4.5x-oversampled inner loop. Only counters / lfsr / env level mutate. */
-  const unsigned tp0 = tone_period(ssg, 0), tp1 = tone_period(ssg, 1), tp2 = tone_period(ssg, 2);
+  /* Hoist the mix-invariant register decode AND all mutable state (counters,
+     LFSR, envelope, tone flip-flops, ring index) into locals. Without this the
+     compiler reloads/stores them through the ssg pointer every raw sample,
+     because it cannot prove the r->buf writes do not alias ssg. */
+  const unsigned tp[3] = { tone_period(ssg, 0), tone_period(ssg, 1), tone_period(ssg, 2) };
   const unsigned np = (unsigned)noise_period(ssg);
   const unsigned ep = (unsigned)env_period(ssg);
   const unsigned reg7 = ssg->regs[0x7];
-  const bool cenv0 = chan_env(ssg, 0), cenv1 = chan_env(ssg, 1), cenv2 = chan_env(ssg, 2);
-  const int tv0 = (tone_volume(ssg, 0) << 1) + 1, tv1 = (tone_volume(ssg, 1) << 1) + 1,
-            tv2 = (tone_volume(ssg, 2) << 1) + 1;
-  const unsigned tdis0 = reg7 & 1, tdis1 = (reg7 >> 1) & 1, tdis2 = (reg7 >> 2) & 1;
-  const unsigned ndis0 = (reg7 >> 3) & 1, ndis1 = (reg7 >> 4) & 1, ndis2 = (reg7 >> 5) & 1;
-  const unsigned tp[3] = {tp0, tp1, tp2};
-  const bool cenv[3] = {cenv0, cenv1, cenv2};
-  const int tv[3] = {tv0, tv1, tv2};
-  const unsigned tdis[3] = {tdis0, tdis1, tdis2}, ndis[3] = {ndis0, ndis1, ndis2};
+  const bool cenv[3] = { chan_env(ssg, 0), chan_env(ssg, 1), chan_env(ssg, 2) };
+  const int tv[3] = { (tone_volume(ssg,0)<<1)+1, (tone_volume(ssg,1)<<1)+1, (tone_volume(ssg,2)<<1)+1 };
+  const unsigned tdis[3] = { reg7 & 1, (reg7 >> 1) & 1, (reg7 >> 2) & 1 };
+  const unsigned ndis[3] = { (reg7 >> 3) & 1, (reg7 >> 4) & 1, (reg7 >> 5) & 1 };
+  const unsigned mask = ssg->mask;
+  const bool ealt = ssg->env_alt, ehld = ssg->env_hld;
+
+  uint8_t nc = ssg->noise_counter;
+  uint32_t lfsr = ssg->lfsr;
+  uint16_t ec = ssg->env_counter;
+  uint8_t el = ssg->env_level;
+  bool eatt = ssg->env_att, eholding = ssg->env_holding;
+  uint16_t tc[3] = { ssg->tone_counter[0], ssg->tone_counter[1], ssg->tone_counter[2] };
+  bool to[3] = { ssg->tone_out[0], ssg->tone_out[1], ssg->tone_out[2] };
+  unsigned idx = r->index;
+  int16_t *rbuf = r->buf;
 
   for (unsigned i = 0; i < samples; i++) {
-    /* generate the raw samples that fall in this output step (4 or 5) */
-    unsigned ssg_samples = ((r->index + 9) >> 1) - (r->index >> 1);
+    unsigned ssg_samples = ((idx + 9) >> 1) - (idx >> 1);
     for (unsigned j = 0; j < ssg_samples; j++) {
-      if (((++ssg->noise_counter) >> 1) >= np) {
-        ssg->noise_counter = 0;
-        ssg->lfsr |= (!((ssg->lfsr & 1) ^ ((ssg->lfsr >> 3) & 1))) << 17;
-        ssg->lfsr >>= 1;
+      if (((++nc) >> 1) >= np) {
+        nc = 0;
+        lfsr |= (!((lfsr & 1) ^ ((lfsr >> 3) & 1))) << 17;
+        lfsr >>= 1;
       }
-      if (!ssg->env_holding) {
-        if (++ssg->env_counter >= ep) {
-          ssg->env_counter = 0;
-          ssg->env_level++;
-          if (ssg->env_level == 0x20) {
-            ssg->env_level = 0;
-            if (ssg->env_alt) ssg->env_att = !ssg->env_att;
-            if (ssg->env_hld) { ssg->env_level = 0x1f; ssg->env_holding = true; }
+      if (!eholding) {
+        if (++ec >= ep) {
+          ec = 0;
+          el++;
+          if (el == 0x20) {
+            el = 0;
+            if (ealt) eatt = !eatt;
+            if (ehld) { el = 0x1f; eholding = true; }
           }
         }
       }
-      const unsigned lfsr1 = ssg->lfsr & 1;
-      const int envlvl = ssg->env_att ? ssg->env_level : 31 - ssg->env_level;
-      const unsigned pos = BUFINDEX(r->index, j) * 3;
+      const unsigned lfsr1 = lfsr & 1;
+      const int envlvl = eatt ? el : 31 - el;
+      const unsigned pos = BUFINDEX(idx, j) * 3;
       for (int ch = 0; ch < 3; ch++) {
-        if (++ssg->tone_counter[ch] >= tp[ch]) {
-          ssg->tone_counter[ch] = 0;
-          ssg->tone_out[ch] = !ssg->tone_out[ch];
-        }
+        if (++tc[ch] >= tp[ch]) { tc[ch] = 0; to[ch] = !to[ch]; }
         int level = cenv[ch] ? envlvl : tv[ch];
         int16_t o;
         if (!(tdis[ch] && ndis[ch])) {
-          bool toneout = tp[ch] < 8 ? true : ssg->tone_out[ch];
+          bool toneout = tp[ch] < 8 ? true : to[ch];
           bool on = (toneout || tdis[ch]) && (lfsr1 || ndis[ch]);
           o = on ? (int16_t)voltable[level] : (int16_t)(-(int)voltable[level]);
         } else {
           o = (int16_t)(voltable[level] * 2);
         }
-        r->buf[pos + ch] = o;
+        rbuf[pos + ch] = o;
       }
     }
-    r->index += 9;
-    r->index &= (2 * PFM_SSG_RING) - 1;
+    idx = (idx + 9) & (2 * PFM_SSG_RING - 1);
 
     /* box-average /9 (rectangular FIR matching the 9/2 ratio) */
     int32_t sample = 0;
     for (int ch = 0; ch < 3; ch++) {
-      unsigned ind = (r->index & 1) ? BUFINDEX(r->index, 5) : BUFINDEX(r->index, 0);
-      int32_t out = r->buf[ind * 3 + ch];
-      for (int s = 0; s < 4; s++) out += r->buf[BUFINDEX(r->index, s + 1) * 3 + ch] * 2;
+      unsigned ind = (idx & 1) ? BUFINDEX(idx, 5) : BUFINDEX(idx, 0);
+      int32_t out = rbuf[ind * 3 + ch];
+      for (int s = 0; s < 4; s++) out += rbuf[BUFINDEX(idx, s + 1) * 3 + ch] * 2;
       out /= 9;
-      if (!(ssg->mask & (1u << ch))) sample += out;
+      if (!(mask & (1u << ch))) sample += out;
     }
-
     int32_t lo = buf[i * 2 + 0] + sample;
     int32_t ro = buf[i * 2 + 1] + sample;
     buf[i * 2 + 0] = (int16_t)pfm_clamp16(lo);
     buf[i * 2 + 1] = (int16_t)pfm_clamp16(ro);
   }
+
+  ssg->noise_counter = nc;
+  ssg->lfsr = lfsr;
+  ssg->env_counter = ec;
+  ssg->env_level = el;
+  ssg->env_att = eatt;
+  ssg->env_holding = eholding;
+  ssg->tone_counter[0] = tc[0]; ssg->tone_counter[1] = tc[1]; ssg->tone_counter[2] = tc[2];
+  ssg->tone_out[0] = to[0]; ssg->tone_out[1] = to[1]; ssg->tone_out[2] = to[2];
+  r->index = idx;
 }
