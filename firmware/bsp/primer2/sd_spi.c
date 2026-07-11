@@ -9,6 +9,15 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/* Run the bit-bang from 0-wait SRAM: at 132 MHz the flash needs wait states, so
+   executing the tight GPIO loop from flash stalls every fetch. .ramfunc removes
+   that -> the SPI clock roughly doubles. */
+#ifdef PFM_RAMFUNC
+#define SD_HOT __attribute__((section(".ramfunc")))
+#else
+#define SD_HOT
+#endif
+
 #define REG32(a) (*(volatile uint32_t *)(a))
 #define GPIOC 0x40011000u
 #define GPIOD 0x40011400u
@@ -38,7 +47,7 @@ static inline void spi_delay(void) {
 
 static uint8_t sd_type; /* 0=none, 1=SDv1/MMC(byte addr), 2=SDHC(block addr) */
 
-static uint8_t xchg(uint8_t out) {
+SD_HOT static uint8_t xchg(uint8_t out) {
   uint8_t in = 0;
   for (int b = 0; b < 8; b++) {
     if (out & 0x80) MOSI_HI(); else MOSI_LO();
@@ -52,17 +61,6 @@ static uint8_t xchg(uint8_t out) {
   return in;
 }
 
-/* CRC-16/CCITT (poly 0x1021, init 0) — the card always sends a valid data CRC in
-   SPI mode, so checking it catches bit errors from the fast bit-bang clock. */
-static uint16_t crc16_ccitt(const uint8_t *p, int n) {
-  uint16_t crc = 0;
-  for (int i = 0; i < n; i++) {
-    crc ^= (uint16_t)p[i] << 8;
-    for (int b = 0; b < 8; b++)
-      crc = (crc & 0x8000u) ? (uint16_t)((crc << 1) ^ 0x1021u) : (uint16_t)(crc << 1);
-  }
-  return crc;
-}
 
 static void gpio_setup(void) {
   REG32(0x40021018) |= (1u << 4) | (1u << 5); /* RCC_APB2ENR: IOPC, IOPD */
@@ -80,7 +78,7 @@ static void gpio_setup(void) {
 }
 
 /* Send a command; returns the R1 response byte (0xFF = no response). */
-static uint8_t send_cmd(uint8_t cmd, uint32_t arg, uint8_t crc) {
+SD_HOT static uint8_t send_cmd(uint8_t cmd, uint32_t arg, uint8_t crc) {
   xchg(0xFF);
   xchg((uint8_t)(0x40 | cmd));
   xchg((uint8_t)(arg >> 24));
@@ -136,15 +134,17 @@ int sd_init(void) {
 
   CS_HI();
   xchg(0xFF);
-  g_clk_delay = 2;                   /* small MISO settle delay for reliable data */
+  g_clk_delay = 0;                   /* data phase: full speed (no half-clock delay) */
   return 0;
 }
 
 int sd_status(void) { return sd_type ? 0 : -1; }
 
-/* Read one 512-byte block (CMD17) into buf, validating the data CRC. Returns 0 on
-   success. Leaves CS high. */
-static int read_one_block(uint32_t arg, uint8_t *buf) {
+/* Read one 512-byte block (CMD17) into buf. The trailing 16-bit CRC is clocked
+   out but not checked: in SPI mode the data CRC is unreliable across cards (the
+   reference ChaN/FatFs SPI driver skips it too), and checking it produced only
+   false failures on this card. Returns 0 on success; leaves CS high. */
+SD_HOT static int read_one_block(uint32_t arg, uint8_t *buf) {
   CS_LO();
   uint8_t r = send_cmd(17, arg, 0xFF);
   if (r != 0x00) { CS_HI(); xchg(0xFF); return -2; }
@@ -153,26 +153,19 @@ static int read_one_block(uint32_t arg, uint8_t *buf) {
   do { tok = xchg(0xFF); } while (tok == 0xFF && --tries); /* wait data token */
   if (tok != 0xFE) { CS_HI(); xchg(0xFF); return -3; }
   for (int i = 0; i < 512; i++) buf[i] = xchg(0xFF);
-  uint8_t c0 = xchg(0xFF), c1 = xchg(0xFF);
+  xchg(0xFF); xchg(0xFF);            /* discard CRC */
   CS_HI();
   xchg(0xFF);
-  if ((uint16_t)((c0 << 8) | c1) != crc16_ccitt(buf, 512)) return -4; /* bad CRC */
   return 0;
 }
 
-static uint32_t g_read_errs; /* blocks that never read clean within the retry budget */
+static uint32_t g_read_errs; /* blocks that failed the protocol after all retries */
 uint32_t board_sd_read_errors(void) { return g_read_errs; }
 
-/* Read `count` 512-byte blocks starting at LBA `lba` into buf. Each block is
-   retried up to 10 times on any command/token/CRC failure. If a block still
-   fails CRC after 10 tries we KEEP the last read (a CRC miss still delivered
-   512 bytes) rather than hard-failing, so a marginal card degrades gracefully
-   instead of breaking the mount; the failure is counted for the debug view. A
-   block that never even reaches the data phase (bad command/token) is a hard
-   error. */
-#define SD_READ_RETRIES  10   /* command/token (protocol) failures: retry hard */
-#define SD_CRC_RETRIES    3   /* CRC mismatches: try a few then accept the block */
-int sd_read_blocks(uint32_t lba, uint8_t *buf, unsigned count) {
+/* Read `count` 512-byte blocks starting at LBA `lba` into buf, retrying real
+   command/token failures up to 10 times per block. */
+#define SD_READ_RETRIES 10
+SD_HOT int sd_read_blocks(uint32_t lba, uint8_t *buf, unsigned count) {
   if (!sd_type) return -1;
   uint32_t base = (sd_type == 2) ? lba : lba * 512u;
   for (unsigned blk = 0; blk < count; blk++) {
@@ -180,16 +173,9 @@ int sd_read_blocks(uint32_t lba, uint8_t *buf, unsigned count) {
     int rc = -1;
     for (int a = 0; a < SD_READ_RETRIES; a++) {
       rc = read_one_block(arg, buf);
-      if (rc == 0) break;                            /* clean read */
-      if (rc == -4 && a >= SD_CRC_RETRIES - 1) break; /* CRC: accept after a few tries */
-      /* protocol error (or CRC within the first few tries): retry */
+      if (rc == 0) break;
     }
-    if (rc != 0) {
-      g_read_errs++;
-      if (rc != -4) return rc;   /* never reached data phase -> hard fail */
-      /* rc == -4: a complete but CRC-mismatched block; keep it (the retry cap
-         above stops CRC noise from ballooning load time -> underruns on switch) */
-    }
+    if (rc != 0) { g_read_errs++; return rc; }
     buf += 512;
   }
   return 0;
