@@ -61,9 +61,12 @@ SD_HOT static uint8_t xchg(uint8_t out) {
   return in;
 }
 
-/* MISO settle after the SCK rising edge, in nops. Fewer = faster but riskier on
-   marginal wiring; bump if the SD error/fail counters climb or audio corrupts. */
-#define SD_RD_SETTLE "nop\n nop\n"
+/* MISO settle after the SCK rising edge. The known-good C read used g_clk_delay=2
+   (~14 cycles) here; 2 nops was too short and gave marginal reads that corrupted
+   multi-block song loads (single-sector dir reads tolerated it). Match the proven
+   timing. Tune down later once reliability is confirmed via the throughput/error
+   counters. */
+#define SD_RD_SETTLE ".rept 14\n   nop\n   .endr\n"
 
 /* Fast data-read: clock in `n` bytes with MOSI held high, MSB first, SPI mode 0.
    Hand-written Thumb-2, 8x unrolled, addresses/masks hoisted into registers, run
