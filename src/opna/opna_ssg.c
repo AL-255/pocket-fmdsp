@@ -95,7 +95,9 @@ PFM_HOT void opna_ssg_mix(struct opna_ssg *ssg, struct opna_ssg_resampler *r,
   uint8_t el = ssg->env_level;
   bool eatt = ssg->env_att, eholding = ssg->env_holding;
   uint16_t tc0 = ssg->tone_counter[0], tc1 = ssg->tone_counter[1], tc2 = ssg->tone_counter[2];
-  bool to0 = ssg->tone_out[0], to1 = ssg->tone_out[1], to2 = ssg->tone_out[2];
+  /* Pack the 3 tone-output flags into one word: toggling becomes a register XOR
+     instead of a stack load-modify-store (the disasm's hottest spill). */
+  unsigned topack = (ssg->tone_out[0] ? 1u : 0) | (ssg->tone_out[1] ? 2u : 0) | (ssg->tone_out[2] ? 4u : 0);
   unsigned idx = r->index;
 
   for (unsigned i = 0; i < samples; i++) {
@@ -121,17 +123,17 @@ PFM_HOT void opna_ssg_mix(struct opna_ssg *ssg, struct opna_ssg_resampler *r,
       }
       const unsigned lfsr1 = lfsr & 1;
       const int venv = anyenv ? (int)voltable[eatt ? el : 31 - el] : 0;
-      if (++tc0 >= tp0) { tc0 = 0; to0 = !to0; }
-      if (++tc1 >= tp1) { tc1 = 0; to1 = !to1; }
-      if (++tc2 >= tp2) { tc2 = 0; to2 = !to2; }
+      if (++tc0 >= tp0) { tc0 = 0; topack ^= 1u; }
+      if (++tc1 >= tp1) { tc1 = 0; topack ^= 2u; }
+      if (++tc2 >= tp2) { tc2 = 0; topack ^= 4u; }
       int v0 = ce0 ? venv : volc0;
       int v1 = ce1 ? venv : volc1;
       int v2 = ce2 ? venv : volc2;
-      if (!bd0) s0 += ((tf0 || to0 || td0) && (lfsr1 || nd0)) ? v0 : -v0;
+      if (!bd0) s0 += ((tf0 || (topack & 1u) || td0) && (lfsr1 || nd0)) ? v0 : -v0;
       else s0 += v0 * 2;
-      if (!bd1) s1 += ((tf1 || to1 || td1) && (lfsr1 || nd1)) ? v1 : -v1;
+      if (!bd1) s1 += ((tf1 || (topack & 2u) || td1) && (lfsr1 || nd1)) ? v1 : -v1;
       else s1 += v1 * 2;
-      if (!bd2) s2 += ((tf2 || to2 || td2) && (lfsr1 || nd2)) ? v2 : -v2;
+      if (!bd2) s2 += ((tf2 || (topack & 4u) || td2) && (lfsr1 || nd2)) ? v2 : -v2;
       else s2 += v2 * 2;
     }
     int32_t rr = inv[ticks];
@@ -152,6 +154,6 @@ PFM_HOT void opna_ssg_mix(struct opna_ssg *ssg, struct opna_ssg_resampler *r,
   ssg->env_att = eatt;
   ssg->env_holding = eholding;
   ssg->tone_counter[0] = tc0; ssg->tone_counter[1] = tc1; ssg->tone_counter[2] = tc2;
-  ssg->tone_out[0] = to0; ssg->tone_out[1] = to1; ssg->tone_out[2] = to2;
+  ssg->tone_out[0] = topack & 1u; ssg->tone_out[1] = (topack >> 1) & 1u; ssg->tone_out[2] = (topack >> 2) & 1u;
   r->index = idx;
 }
