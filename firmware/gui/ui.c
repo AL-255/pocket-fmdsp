@@ -261,6 +261,30 @@ static int src_load_idx(int idx) {
   }
   return board_storage_load(idx, g_songbuf, sizeof(g_songbuf));
 }
+
+/* Dedicated highest-priority SD-read task. The app task posts a request (idx) and
+   blocks; this task does the actual (blocking) FatFs read and posts back, so the
+   read runs uninterrupted at the top priority. */
+static TaskHandle_t g_sd_task, g_app_task;
+static volatile int g_sd_req_idx, g_sd_result;
+void ui_set_task_handles(void *sd, void *app) {
+  g_sd_task = (TaskHandle_t)sd; g_app_task = (TaskHandle_t)app;
+}
+void ui_sd_task(void) {
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);   /* wait for a load request */
+    g_sd_result = src_load_idx(g_sd_req_idx);  /* the actual SD read */
+    if (g_app_task) xTaskNotifyGive(g_app_task);
+  }
+}
+/* Called from the app task: run the SD read on the top-priority sd task and wait. */
+static int sd_load(int idx) {
+  if (!g_sd_task || !g_app_task) return src_load_idx(idx);  /* fallback */
+  g_sd_req_idx = idx;
+  xTaskNotifyGive(g_sd_task);                  /* sd task preempts + reads */
+  ulTaskNotifyTake(pdTRUE, portMAX_DELAY);     /* block until it's done */
+  return g_sd_result;
+}
 static void src_window(int top) {
   for (int w = 0; w < VISROWS; w++) g_names[w][0] = 0;
   int cnt = src_count();
@@ -417,7 +441,7 @@ static int start_song(pfm_player *p, int idx) {
   /* Silence the current song before we overwrite its buffer, so the (blocking)
      SD read plays out muted rather than glitching. */
   if (g_song_loaded) { board_audio_mute(1); g_muted_swap = 1; }
-  int len = src_load_idx(idx);                 /* SD read: 10x per-block retry + CRC */
+  int len = sd_load(idx);                      /* SD read on the top-priority sd task */
   g_dbg_len = len;
   if (len <= 0) goto fail;                      /* card read failed */
   pfm_player_init(p);
