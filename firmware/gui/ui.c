@@ -535,7 +535,9 @@ void ui_lcd_task(void) {
   uint32_t last_frames = 0, last_drops = 0, last_cons = 0;
   for (;;) {
     vTaskDelay(pdMS_TO_TICKS(60));
-    if (g_page != PG_PLAY || !g_song_loaded || !g_lcd_on) {
+    /* Skip while swapping songs: the load stalls the producer (muted, so silent)
+       and would otherwise register as CPU/DR noise. Re-baseline and wait. */
+    if (g_page != PG_PLAY || !g_song_loaded || !g_lcd_on || g_muted_swap) {
       last_frames = g_render_frames;
       last_drops = board_audio_underruns();
       last_cons = board_audio_consumed_frames();
